@@ -2,6 +2,3 @@ name = "sep"
 main = "worker.js"
 compatibility_date = "2024-06-05"
 
-[[kv_namespaces]]
-binding = "sep_kv"
-id = "5418beb88a764d5cb19a9d40826e5c8d"
