@@ -1,1122 +1,1034 @@
-// ============================================
-// PCB设计工会 - 高级UI版
-// Workers KV绑定名: sep_kv
-// ============================================
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    
-    if (url.pathname === '/api/state') {
-      return handleStateAPI(request, env);
-    }
-    
-    return new Response(getHTML(), {
-      headers: { 
-        'Content-Type': 'text/html;charset=UTF-8',
-        'Cache-Control': 'no-cache'
-      }
-    });
-  }
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include "USB.h"
+#include "USBHID.h"
+#include "usb/usb_host.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+// ====================== 引入 TinyUSB HID 库（用于有线键盘）======================
+#include <Adafruit_TinyUSB.h>
+
+// ====================== 配置常量 ======================
+const char* AP_SSID           = "ESP32-Bridge";
+const char* AP_PASSWORD       = "12345678";
+const int   PRINT_PORT        = 9100;
+const int   WEB_PORT          = 80;
+const int   WS_PORT           = 81;
+const int   MAX_WIFI_NETWORKS = 5;
+
+// 工作模式
+enum WorkMode { MODE_PRINTER, MODE_REMOTE };
+enum NetMode { MODE_WIFI_CLIENT, MODE_AP };
+enum UsbDeviceType { DEV_NONE, DEV_PRINTER, DEV_KEYBOARD, DEV_MOUSE, DEV_UNKNOWN };
+
+// ====================== 全局变量 ======================
+// 工作模式
+volatile WorkMode currentWorkMode = MODE_REMOTE;
+NetMode currentNetMode = MODE_WIFI_CLIENT;
+UsbDeviceType connectedDevice = DEV_NONE;
+
+// 打印机模式标志
+volatile bool printerReady = false;
+volatile bool deviceConnected = false;
+
+// 远控模式标志
+volatile bool remoteReady = false;
+volatile bool usbHidReady = false;
+volatile bool bleReady = false;
+
+// 存储
+Preferences prefs;
+
+// 服务器
+WebServer server(WEB_PORT);
+WebSocketsServer webSocket = WebSocketsServer(WS_PORT);
+DNSServer dnsServer;
+
+// WiFi 配置
+struct WiFiConfig {
+  String ssid;
+  String password;
+};
+WiFiConfig savedNetworks[MAX_WIFI_NETWORKS];
+int savedNetworkCount = 0;
+
+// ====================== 打印机相关变量 ======================
+WiFiServer printServer(PRINT_PORT);
+static usb_host_client_handle_t clientHandle = NULL;
+static usb_device_handle_t      deviceHandle = NULL;
+static uint8_t                  bulkOutEpAddr = 0;
+static uint8_t                  bulkOutEpMps  = 64;
+static uint8_t                  printerInterfaceNum = 0;
+
+// 传输相关
+#define TRANSFER_MAX_SIZE 1024
+#define TRANSFER_POOL_SIZE 6
+static QueueHandle_t transferQueue = NULL;
+static SemaphoreHandle_t usbMutex = NULL;
+
+// 数据缓冲
+#define USB_RECV_BUF_SIZE 4096
+static uint8_t recvBuf[USB_RECV_BUF_SIZE];
+
+// ====================== 远控模式相关变量 ======================
+// 有线 HID
+Adafruit_USBD_HID usb_hid;
+
+// 蓝牙 HID
+#include <BleKeyboard.h>
+BleKeyboard bleKeyboard("ESP32 Remote", "Espressif", 100);
+
+// 当前按下的修饰键
+volatile bool ctrlPressed = false;
+volatile bool altPressed = false;
+volatile bool shiftPressed = false;
+volatile bool guiPressed = false;
+
+// 按键映射表
+struct KeyMapping {
+  const char* name;
+  uint8_t key;
 };
 
-// ============ 加密工具 ============
+KeyMapping keyMap[] = {
+  {"enter", HID_KEY_ENTER},
+  {"space", HID_KEY_SPACE},
+  {"tab", HID_KEY_TAB},
+  {"esc", HID_KEY_ESCAPE},
+  {"backspace", HID_KEY_BACKSPACE},
+  {"del", HID_KEY_DELETE},
+  {"up", HID_KEY_ARROW_UP},
+  {"down", HID_KEY_ARROW_DOWN},
+  {"left", HID_KEY_ARROW_LEFT},
+  {"right", HID_KEY_ARROW_RIGHT},
+  {"home", HID_KEY_HOME},
+  {"end", HID_KEY_END},
+  {"pgup", HID_KEY_PAGE_UP},
+  {"pgdn", HID_KEY_PAGE_DOWN},
+  {"f1", HID_KEY_F1},
+  {"f2", HID_KEY_F2},
+  {"f3", HID_KEY_F3},
+  {"f4", HID_KEY_F4},
+  {"f5", HID_KEY_F5},
+  {"f6", HID_KEY_F6},
+  {"f7", HID_KEY_F7},
+  {"f8", HID_KEY_F8},
+  {"f9", HID_KEY_F9},
+  {"f10", HID_KEY_F10},
+  {"f11", HID_KEY_F11},
+  {"f12", HID_KEY_F12}
+};
 
-async function getHMACKey(env) {
-  let keyBase64 = await env.sep_kv.get('hmac_secret');
-  if (!keyBase64) {
-    const key = await crypto.subtle.generateKey(
-      { name: 'HMAC', hash: 'SHA-256' },
-      true,
-      ['sign', 'verify']
-    );
-    const exported = await crypto.subtle.exportKey('raw', key);
-    keyBase64 = btoa(String.fromCharCode(...new Uint8Array(exported)));
-    await env.sep_kv.put('hmac_secret', keyBase64);
-  }
-  
-  const keyBytes = Uint8Array.from(atob(keyBase64), c => c.charCodeAt(0));
-  return await crypto.subtle.importKey(
-    'raw', keyBytes,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false, ['sign', 'verify']
-  );
-}
+int keyMapSize = sizeof(keyMap) / sizeof(keyMap[0]);
 
-async function generateToken(username, role, env) {
-  const key = await getHMACKey(env);
-  const payload = JSON.stringify({
-    username, role,
-    exp: Date.now() + 24 * 60 * 60 * 1000,
-    iat: Date.now()
-  });
+// ====================== WiFi 配置存储 ======================
+void loadWiFiConfigs() {
+  savedNetworkCount = prefs.getInt("wifi_count", 0);
+  if (savedNetworkCount > MAX_WIFI_NETWORKS) savedNetworkCount = MAX_WIFI_NETWORKS;
   
-  const encoder = new TextEncoder();
-  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
-  const sigBase64 = btoa(String.fromCharCode(...new Uint8Array(signature)));
-  
-  return btoa(payload) + '.' + sigBase64;
-}
-
-async function verifyToken(token, env) {
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 2) return null;
-    
-    const payload = JSON.parse(atob(parts[0]));
-    const signature = parts[1];
-    
-    if (payload.exp < Date.now()) return null;
-    
-    const key = await getHMACKey(env);
-    const encoder = new TextEncoder();
-    const sigBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
-    const isValid = await crypto.subtle.verify(
-      'HMAC', key, sigBytes,
-      encoder.encode(JSON.stringify(payload))
-    );
-    
-    return isValid ? payload : null;
-  } catch (e) {
-    return null;
+  for (int i = 0; i < savedNetworkCount; i++) {
+    String keySsid = "wifi_" + String(i) + "_ssid";
+    String keyPwd  = "wifi_" + String(i) + "_pwd";
+    savedNetworks[i].ssid = prefs.getString(keySsid.c_str(), "");
+    savedNetworks[i].password = prefs.getString(keyPwd.c_str(), "");
+    Serial.printf("[STORAGE] Loaded WiFi %d: %s\n", i, savedNetworks[i].ssid.c_str());
   }
 }
 
-// ============ 日志工具 ============
-
-async function addLog(env, action, username, detail) {
-  try {
-    const now = new Date();
-    const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-    const logEntry = {
-      id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
-      timestamp: now.getTime(),
-      time: beijingTime.toISOString().replace('T', ' ').substring(0, 19),
-      action, username: username || '未登录', detail: detail || ''
-    };
-    
-    let logs = await env.sep_kv.get('operation_logs', { type: 'json' }) || [];
-    logs.unshift(logEntry);
-    if (logs.length > 500) logs = logs.slice(0, 500);
-    
-    await env.sep_kv.put('operation_logs', JSON.stringify(logs));
-  } catch (e) {
-    console.error('日志记录失败:', e);
+void saveWiFiConfigs() {
+  prefs.putInt("wifi_count", savedNetworkCount);
+  for (int i = 0; i < savedNetworkCount; i++) {
+    String keySsid = "wifi_" + String(i) + "_ssid";
+    String keyPwd  = "wifi_" + String(i) + "_pwd";
+    prefs.putString(keySsid.c_str(), savedNetworks[i].ssid);
+    prefs.putString(keyPwd.c_str(), savedNetworks[i].password);
   }
 }
 
-// ============ 工具函数 ============
-
-function escapeHtml(str) {
-  if (!str) return '';
-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+void addWiFiNetwork(String ssid, String password) {
+  // 检查是否已存在
+  for (int i = 0; i < savedNetworkCount; i++) {
+    if (savedNetworks[i].ssid == ssid) {
+      savedNetworks[i].password = password;
+      saveWiFiConfigs();
+      Serial.printf("[STORAGE] Updated WiFi: %s\n", ssid.c_str());
+      return;
+    }
+  }
+  
+  // 添加新网络
+  if (savedNetworkCount < MAX_WIFI_NETWORKS) {
+    savedNetworks[savedNetworkCount].ssid = ssid;
+    savedNetworks[savedNetworkCount].password = password;
+    savedNetworkCount++;
+    saveWiFiConfigs();
+    Serial.printf("[STORAGE] Added WiFi: %s\n", ssid.c_str());
+  } else {
+    Serial.println("[STORAGE] WiFi limit reached");
+  }
 }
 
-function getBeijingTimeShort() {
-  const now = new Date();
-  const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-  return beijingTime.toISOString().substring(11, 16);
+void removeWiFiNetwork(int index) {
+  if (index < 0 || index >= savedNetworkCount) return;
+  
+  for (int i = index; i < savedNetworkCount - 1; i++) {
+    savedNetworks[i] = savedNetworks[i + 1];
+  }
+  savedNetworkCount--;
+  saveWiFiConfigs();
+  Serial.printf("[STORAGE] Removed WiFi index: %d\n", index);
 }
 
-function getBeijingDate() {
-  const now = new Date();
-  const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-  return beijingTime.toISOString().substring(0, 10);
+void clearAllWiFi() {
+  savedNetworkCount = 0;
+  saveWiFiConfigs();
+  Serial.println("[STORAGE] Cleared all WiFi");
 }
 
-// ============ API 处理 ============
+// ====================== USB 打印机传输回调 ======================
+void printerTransferCallback(usb_transfer_t* transfer) {
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  
+  switch (transfer->status) {
+    case USB_TRANSFER_STATUS_COMPLETED:
+      ESP_LOGD("USB", "Transfer completed: %d bytes", transfer->actual_num_bytes);
+      break;
+    case USB_TRANSFER_STATUS_TIMED_OUT:
+      ESP_LOGW("USB", "Transfer timeout");
+      break;
+    case USB_TRANSFER_STATUS_CANCELED:
+      ESP_LOGW("USB", "Transfer canceled");
+      break;
+    case USB_TRANSFER_STATUS_STALL:
+      ESP_LOGW("USB", "Transfer stall, clearing...");
+      if (deviceHandle && bulkOutEpAddr) {
+        usb_host_endpoint_halt(deviceHandle, bulkOutEpAddr);
+usb_host_endpoint_flush(deviceHandle, bulkOutEpAddr);
+      }
+      break;
+    default:
+      ESP_LOGW("USB", "Transfer status: %d", transfer->status);
+      break;
+  }
+  
+  // 无论什么状态，都放回队列复用
+  xQueueSendFromISR(transferQueue, &transfer, &xHigherPriorityTaskWoken);
+  if (xHigherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
 
-async function handleStateAPI(request, env) {
-  const headers = {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+// ====================== 发送打印数据 ======================
+bool sendToPrinter(const uint8_t* data, size_t len) {
+  if (!printerReady || deviceHandle == NULL || bulkOutEpAddr == 0) {
+    return false;
+  }
+  
+  // 加互斥锁
+  if (xSemaphoreTake(usbMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    ESP_LOGE("PRINT", "Failed to take USB mutex");
+    return false;
+  }
+  
+  size_t sent = 0;
+  bool success = true;
+  
+  while (sent < len) {
+    size_t chunk = min((size_t)bulkOutEpMps, len - sent);
+    
+    usb_transfer_t* transfer = NULL;
+    if (xQueueReceive(transferQueue, &transfer, pdMS_TO_TICKS(500)) != pdTRUE) {
+      ESP_LOGE("PRINT", "No free transfer");
+      success = false;
+      break;
+    }
+    
+    transfer->num_bytes = chunk;
+    transfer->device_handle = deviceHandle;
+    transfer->bEndpointAddress = bulkOutEpAddr;
+    transfer->callback = printerTransferCallback;
+    memcpy(transfer->data_buffer, data + sent, chunk);
+    
+    esp_err_t err = usb_host_transfer_submit(transfer);
+    if (err != ESP_OK) {
+      ESP_LOGE("PRINT", "Submit failed: %s", esp_err_to_name(err));
+      xQueueSend(transferQueue, &transfer, portMAX_DELAY);
+      success = false;
+      break;
+    }
+    
+    sent += chunk;
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  
+  // 处理 ZLP（零长度包）
+  if (success && len > 0 && (len % bulkOutEpMps) == 0) {
+    ESP_LOGD("PRINT", "Sending ZLP");
+    usb_transfer_t* zlpTransfer = NULL;
+    if (xQueueReceive(transferQueue, &zlpTransfer, pdMS_TO_TICKS(500)) == pdTRUE) {
+      zlpTransfer->num_bytes = 0;
+      zlpTransfer->device_handle = deviceHandle;
+      zlpTransfer->bEndpointAddress = bulkOutEpAddr;
+      zlpTransfer->callback = printerTransferCallback;
+      
+      esp_err_t err = usb_host_transfer_submit(zlpTransfer);
+      if (err != ESP_OK) {
+        ESP_LOGW("PRINT", "ZLP submit failed");
+        xQueueSend(transferQueue, &zlpTransfer, portMAX_DELAY);
+      }
+    }
+  }
+  
+  xSemaphoreGive(usbMutex);
+  return success;
+}
+
+// ====================== 初始化打印机 ======================
+bool initPrinterDevice(uint8_t devAddr) {
+  esp_err_t err;
+  
+  err = usb_host_device_open(clientHandle, devAddr, &deviceHandle);
+  if (err != ESP_OK) {
+    ESP_LOGE("USB", "Device open failed");
+    return false;
+  }
+  
+  const usb_device_desc_t* devDesc;
+  usb_host_get_device_descriptor(deviceHandle, &devDesc);
+  ESP_LOGI("USB", "VID:0x%04X, PID:0x%04X", devDesc->idVendor, devDesc->idProduct);
+  
+  const usb_config_desc_t* cfgDesc;
+  usb_host_get_active_config_descriptor(deviceHandle, &cfgDesc);
+  
+  // 遍历查找打印机接口
+  bool printerFound = false;
+  for (int i = 0; i < cfgDesc->bNumInterfaces; i++) {
+    const usb_intf_desc_t* intf = usb_parse_interface_descriptor(cfgDesc, i, 0, NULL);
+    if (intf == NULL) continue;
+    
+    if (intf->bInterfaceClass == 0x07) {  // 打印机类
+      printerFound = true;
+      printerInterfaceNum = intf->bInterfaceNumber;
+      
+      for (int j = 0; j < intf->bNumEndpoints; j++) {
+        const usb_ep_desc_t* ep = usb_parse_endpoint_descriptor(intf, j);
+        if (ep == NULL) continue;
+        
+        if ((ep->bmAttributes & 0x03) == USB_TRANSFER_TYPE_BULK) {
+          if ((ep->bEndpointAddress & 0x80) == 0) {
+            bulkOutEpAddr = ep->bEndpointAddress;
+            bulkOutEpMps = ep->wMaxPacketSize;
+            ESP_LOGI("USB", "Bulk OUT: 0x%02X, MPS:%d", bulkOutEpAddr, bulkOutEpMps);
+          }
+        }
+      }
+      break;
+    }
+  }
+  
+  if (!printerFound || bulkOutEpAddr == 0) {
+    ESP_LOGE("USB", "Printer not found");
+    usb_host_device_close(clientHandle, deviceHandle);
+    deviceHandle = NULL;
+    return false;
+  }
+  
+  err = usb_host_interface_claim(clientHandle, deviceHandle, printerInterfaceNum, 0);
+  if (err != ESP_OK) {
+    ESP_LOGE("USB", "Interface claim failed");
+    usb_host_device_close(clientHandle, deviceHandle);
+    deviceHandle = NULL;
+    return false;
+  }
+  
+  return true;
+}
+
+// ====================== USB 事件回调 ======================
+void usbEventCallback(const usb_host_client_event_msg_t* msg, void* arg) {
+  switch (msg->event) {
+    case USB_HOST_CLIENT_EVENT_NEW_DEV:
+      ESP_LOGI("USB", "New device, addr: %d", msg->new_dev.address);
+      
+      if (currentWorkMode == MODE_PRINTER && !deviceConnected) {
+        if (initPrinterDevice(msg->new_dev.address)) {
+          deviceConnected = true;
+          printerReady = true;
+          ESP_LOGI("USB", "Printer ready!");
+        }
+      }
+      break;
+      
+    case USB_HOST_CLIENT_EVENT_DEV_GONE:
+      ESP_LOGI("USB", "Device removed");
+      
+      if (deviceHandle) {
+        usb_host_interface_release(clientHandle, deviceHandle, printerInterfaceNum);
+        usb_host_device_close(clientHandle, deviceHandle);
+        deviceHandle = NULL;
+      }
+      deviceConnected = false;
+      printerReady = false;
+      bulkOutEpAddr = 0;
+      printerInterfaceNum = 0;
+      break;
+      
+    default:
+      break;
+  }
+}
+
+// ====================== USB Host 任务 ======================
+void usbHostTask(void* arg) {
+  while (1) {
+    if (clientHandle) {
+      usb_host_client_handle_events(clientHandle, portMAX_DELAY);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+// ====================== 初始化 USB Host ======================
+void initUsbHost() {
+  usb_host_config_t hostConfig = {
+    .skip_phy_setup = false,
+    .intr_flags = ESP_INTR_FLAG_LEVEL1,
   };
-
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { headers });
-  }
-
-  if (request.method === 'GET') {
-    try {
-      let state = await env.sep_kv.get('app_state', { type: 'json' });
-      if (!state) {
-        state = getDefaultState();
-        await env.sep_kv.put('app_state', JSON.stringify(state));
-      }
-      const safeState = { ...state };
-      safeState.users = state.users.map(u => ({ username: u.username, nickname: u.nickname, role: u.role }));
-      return new Response(JSON.stringify(safeState), { headers });
-    } catch (error) {
-      return new Response(JSON.stringify({ error: '服务器内部错误' }), { status: 500, headers });
+  ESP_ERROR_CHECK(usb_host_install(&hostConfig));
+  
+  usb_host_client_config_t clientConfig = {
+    .is_synchronous = false,
+    .max_num_event_msg = 10,
+    .async = {
+      .client_event_callback = usbEventCallback,
+      .callback_arg = NULL,
+    },
+  };
+  ESP_ERROR_CHECK(usb_host_client_register(&clientConfig, &clientHandle));
+  
+  // 创建传输队列
+  transferQueue = xQueueCreate(TRANSFER_POOL_SIZE, sizeof(usb_transfer_t*));
+  for (int i = 0; i < TRANSFER_POOL_SIZE; i++) {
+    usb_transfer_t* transfer = NULL;
+    if (usb_host_transfer_alloc(TRANSFER_MAX_SIZE, 0, &transfer) == ESP_OK) {
+      transfer->callback = printerTransferCallback;
+      xQueueSend(transferQueue, &transfer, portMAX_DELAY);
     }
   }
-
-  if (request.method === 'POST') {
-    try {
-      const data = await request.json();
-      const { token, action, payload } = data;
-
-      let state = await env.sep_kv.get('app_state', { type: 'json' });
-      if (!state) state = getDefaultState();
-
-      let currentUser = null;
-
-      if (action !== 'login' && action !== 'getLogs') {
-        if (!token) {
-          return new Response(JSON.stringify({ error: '请先登录' }), { status: 401, headers });
-        }
-        currentUser = await verifyToken(token, env);
-        if (!currentUser) {
-          return new Response(JSON.stringify({ error: '登录已过期，请重新登录' }), { status: 401, headers });
-        }
-        const userExists = state.users.find(u => u.username === currentUser.username);
-        if (!userExists) {
-          return new Response(JSON.stringify({ error: '账号已被删除' }), { status: 403, headers });
-        }
-        currentUser.role = userExists.role;
-        currentUser.nickname = userExists.nickname;
-      }
-
-      let newToken = token;
-
-      switch (action) {
-        case 'login': {
-          const { username, password } = payload;
-          if (!username || !password) {
-            return new Response(JSON.stringify({ error: '用户名和密码不能为空' }), { status: 400, headers });
-          }
-          const loginUser = state.users.find(u => u.username === username && u.password === password);
-          if (!loginUser) {
-            return new Response(JSON.stringify({ error: '账号或密码错误' }), { status: 401, headers });
-          }
-          newToken = await generateToken(loginUser.username, loginUser.role, env);
-          await addLog(env, '登录', username, '用户登录成功');
-          return new Response(JSON.stringify({ 
-            success: true, token: newToken,
-            user: { username: loginUser.username, role: loginUser.role, nickname: loginUser.nickname } 
-          }), { headers });
-        }
-
-        case 'getLogs': {
-          if (token) {
-            currentUser = await verifyToken(token, env);
-            if (!currentUser || currentUser.role !== 'admin') {
-              return new Response(JSON.stringify({ error: '仅管理员可查看日志' }), { status: 403, headers });
-            }
-            const logs = await env.sep_kv.get('operation_logs', { type: 'json' }) || [];
-            return new Response(JSON.stringify({ success: true, logs }), { headers });
-          }
-          return new Response(JSON.stringify({ error: '未授权' }), { status: 403, headers });
-        }
-
-        case 'clearLogs': {
-          if (currentUser.role !== 'admin') {
-            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
-          }
-          await env.sep_kv.put('operation_logs', JSON.stringify([]));
-          await addLog(env, '清空日志', currentUser.username, '管理员清空了操作日志');
-          break;
-        }
-
-        case 'addPost': {
-          const title = escapeHtml(payload.title || '');
-          const content = escapeHtml(payload.content || '');
-          if (!title || !content) {
-            return new Response(JSON.stringify({ error: '标题和内容不能为空' }), { status: 400, headers });
-          }
-          state.posts.unshift({
-            id: Date.now(),
-            author: currentUser.username,
-            authorNickname: escapeHtml(currentUser.nickname),
-            title, content,
-            date: getBeijingDate(),
-            timestamp: Date.now()
-          });
-          await addLog(env, '发布帖子', currentUser.username, '标题: ' + title);
-          break;
-        }
-
-        case 'deletePost': {
-          const postId = payload.id;
-          const post = state.posts.find(p => p.id === postId);
-          if (!post) {
-            return new Response(JSON.stringify({ error: '帖子不存在' }), { status: 404, headers });
-          }
-          if (currentUser.role !== 'admin' && post.author !== currentUser.username) {
-            return new Response(JSON.stringify({ error: '无权限删除此帖子' }), { status: 403, headers });
-          }
-          state.posts = state.posts.filter(p => p.id !== postId);
-          await addLog(env, '删除帖子', currentUser.username, '帖子ID: ' + postId);
-          break;
-        }
-
-        case 'addMarketItem': {
-          const name = escapeHtml(payload.name || '');
-          const price = escapeHtml(payload.price || '');
-          const desc = escapeHtml(payload.desc || '');
-          if (!name || !price) {
-            return new Response(JSON.stringify({ error: '名称和价格必填' }), { status: 400, headers });
-          }
-          state.marketItems.unshift({
-            id: Date.now(),
-            seller: currentUser.username,
-            sellerNickname: escapeHtml(currentUser.nickname),
-            name, price, desc,
-            timestamp: Date.now()
-          });
-          await addLog(env, '发布市集物品', currentUser.username, '物品: ' + name);
-          break;
-        }
-
-        case 'deleteMarketItem': {
-          const itemId = payload.id;
-          const item = state.marketItems.find(m => m.id === itemId);
-          if (!item) {
-            return new Response(JSON.stringify({ error: '物品不存在' }), { status: 404, headers });
-          }
-          if (currentUser.role !== 'admin' && item.seller !== currentUser.username) {
-            return new Response(JSON.stringify({ error: '无权限删除此物品' }), { status: 403, headers });
-          }
-          state.marketItems = state.marketItems.filter(m => m.id !== itemId);
-          await addLog(env, '下架市集物品', currentUser.username, '物品ID: ' + itemId);
-          break;
-        }
-
-        case 'sendMessage': {
-          if (!state.discussAccessUsers.includes(currentUser.username) && currentUser.role !== 'admin') {
-            return new Response(JSON.stringify({ error: '无讨论权限，请联系管理员' }), { status: 403, headers });
-          }
-          const text = escapeHtml(payload.text || '');
-          if (!text) {
-            return new Response(JSON.stringify({ error: '消息不能为空' }), { status: 400, headers });
-          }
-          state.discussMessages.push({
-            user: escapeHtml(currentUser.nickname || currentUser.username),
-            text, time: getBeijingTimeShort(), timestamp: Date.now()
-          });
-          const now = Date.now();
-          const retentionMs = (state.messageRetentionHours || 24) * 3600000;
-          state.discussMessages = state.discussMessages.filter(m => (now - m.timestamp) < retentionMs);
-          if (state.discussMessages.length > 500) state.discussMessages = state.discussMessages.slice(-500);
-          break;
-        }
-
-        case 'grantAccess': {
-          if (currentUser.role !== 'admin') {
-            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
-          }
-          const grantUsername = payload.username;
-          if (!grantUsername) {
-            return new Response(JSON.stringify({ error: '请输入用户名' }), { status: 400, headers });
-          }
-          const grantUserExists = state.users.find(u => u.username === grantUsername);
-          if (!grantUserExists) {
-            return new Response(JSON.stringify({ error: '用户不存在' }), { status: 400, headers });
-          }
-          if (state.discussAccessUsers.includes(grantUsername)) {
-            return new Response(JSON.stringify({ error: '该用户已有讨论权限' }), { status: 400, headers });
-          }
-          state.discussAccessUsers.push(grantUsername);
-          await addLog(env, '授予讨论权限', currentUser.username, '授予: ' + grantUsername);
-          break;
-        }
-
-        case 'revokeAccess': {
-          if (currentUser.role !== 'admin') {
-            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
-          }
-          state.discussAccessUsers = state.discussAccessUsers.filter(u => u !== payload.username);
-          await addLog(env, '撤销讨论权限', currentUser.username, '撤销: ' + payload.username);
-          break;
-        }
-
-        case 'updateRetention': {
-          if (currentUser.role !== 'admin') {
-            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
-          }
-          const hours = parseInt(payload.hours);
-          if (isNaN(hours) || hours < 1 || hours > 720) {
-            return new Response(JSON.stringify({ error: '保留时间需在 1-720 小时之间' }), { status: 400, headers });
-          }
-          state.messageRetentionHours = hours;
-          await addLog(env, '更新消息保留时间', currentUser.username, hours + '小时');
-          break;
-        }
-
-        case 'clearMessages': {
-          if (currentUser.role !== 'admin') {
-            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
-          }
-          state.discussMessages = [];
-          await addLog(env, '清空讨论消息', currentUser.username, '');
-          break;
-        }
-
-        case 'updateIntro': {
-          if (currentUser.role !== 'admin') {
-            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
-          }
-          state.introContent = payload.content || '';
-          await addLog(env, '更新介绍', currentUser.username, '');
-          break;
-        }
-
-        case 'addUser': {
-          if (currentUser.role !== 'admin') {
-            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
-          }
-          const newUsername = escapeHtml(payload.username || '').trim();
-          const newPassword = payload.password || '';
-          const newNickname = escapeHtml(payload.nickname || '').trim();
-          if (!newUsername || !newPassword) {
-            return new Response(JSON.stringify({ error: '用户名和密码必填' }), { status: 400, headers });
-          }
-          if (state.users.find(u => u.username === newUsername)) {
-            return new Response(JSON.stringify({ error: '用户已存在' }), { status: 400, headers });
-          }
-          state.users.push({ username: newUsername, password: newPassword, role: 'user', nickname: newNickname || newUsername });
-          await addLog(env, '添加用户', currentUser.username, '新用户: ' + newUsername);
-          break;
-        }
-
-        case 'deleteUser': {
-          if (currentUser.role !== 'admin') {
-            return new Response(JSON.stringify({ error: '仅管理员可删除用户' }), { status: 403, headers });
-          }
-          if (payload.username === 'admin') {
-            return new Response(JSON.stringify({ error: '不能删除管理员账号' }), { status: 400, headers });
-          }
-          const userIndex = state.users.findIndex(u => u.username === payload.username);
-          if (userIndex === -1) {
-            return new Response(JSON.stringify({ error: '用户不存在' }), { status: 404, headers });
-          }
-          state.users.splice(userIndex, 1);
-          state.discussAccessUsers = state.discussAccessUsers.filter(u => u !== payload.username);
-          state.posts = state.posts.filter(p => p.author !== payload.username);
-          state.marketItems = state.marketItems.filter(m => m.seller !== payload.username);
-          state.discussMessages = state.discussMessages.filter(m => {
-            const msgUser = state.users.find(u => u.nickname === m.user);
-            return msgUser && msgUser.username !== payload.username;
-          });
-          await addLog(env, '删除用户', currentUser.username, '删除: ' + payload.username);
-          break;
-        }
-
-        case 'updateProfile': {
-          const newNickname = escapeHtml(payload.newNickname || '').trim();
-          const newPassword = payload.newPassword || '';
-          if (!newNickname && !newPassword) {
-            return new Response(JSON.stringify({ error: '没有要更新的内容' }), { status: 400, headers });
-          }
-          const userToUpdate = state.users.find(u => u.username === currentUser.username);
-          if (!userToUpdate) {
-            return new Response(JSON.stringify({ error: '用户不存在' }), { status: 404, headers });
-          }
-          if (newNickname) {
-            userToUpdate.nickname = newNickname;
-            currentUser.nickname = newNickname;
-            state.discussMessages.forEach(m => {
-              if (state.users.find(u => u.nickname === m.user && u.username === currentUser.username)) {
-                m.user = newNickname;
-              }
-            });
-          }
-          if (newPassword) userToUpdate.password = newPassword;
-          newToken = await generateToken(currentUser.username, currentUser.role, env);
-          await addLog(env, '更新个人信息', currentUser.username, '');
-          break;
-        }
-
-        default:
-          return new Response(JSON.stringify({ error: '未知操作' }), { status: 400, headers });
-      }
-
-      await env.sep_kv.put('app_state', JSON.stringify(state));
-      
-      const safeState = { ...state };
-      safeState.users = state.users.map(u => ({ username: u.username, nickname: u.nickname, role: u.role }));
-      
-      return new Response(JSON.stringify({ success: true, token: newToken, state: safeState }), { headers });
-
-    } catch (error) {
-      console.error('POST error:', error);
-      return new Response(JSON.stringify({ error: '服务器内部错误' }), { status: 500, headers });
-    }
-  }
-
-  return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405, headers });
+  
+  usbMutex = xSemaphoreCreateMutex();
+  
+  xTaskCreatePinnedToCore(usbHostTask, "usb_events", 8192, NULL, 3, NULL, 0);
+  
+  USB.begin();
+  Serial.println("[USB] Host initialized");
 }
 
-// ============ 默认状态 ============
+// ====================== 远控模式：有线 HID 键盘 ======================
+void sendUsbKeyReport(uint8_t modifiers, uint8_t keycode) {
+  if (!usbHidReady) return;
+  
+  uint8_t report[8] = {0};
+  report[0] = modifiers;
+  report[2] = keycode;
+  usb_hid.sendReport(1, report, sizeof(report));
+  delay(20);
+  report[0] = 0;
+  report[2] = 0;
+  usb_hid.sendReport(1, report, sizeof(report));
+}
 
-function getDefaultState() {
-  return {
-    users: [
-      { username: 'admin', password: 'pcb2024', role: 'admin', nickname: '工会理事' },
-      { username: 'engineer_lee', password: 'lee123', role: 'user', nickname: 'Lee' },
-      { username: 'soldering_queen', password: 'queen123', role: 'user', nickname: '焊将' }
-    ],
-    posts: [
+void sendUsbKeyPress(uint8_t keycode) {
+  sendUsbKeyReport(0, keycode);
+}
+
+void sendUsbKeyPressWithModifiers(uint8_t keycode, bool ctrl, bool alt, bool shift, bool gui) {
+  uint8_t modifiers = 0;
+  if (ctrl)  modifiers |= 0x01;
+  if (shift) modifiers |= 0x02;
+  if (alt)   modifiers |= 0x04;
+  if (gui)   modifiers |= 0x08;
+  sendUsbKeyReport(modifiers, keycode);
+}
+
+void sendUsbString(const char* str) {
+  while (*str) {
+    char c = *str++;
+    if (c >= 'a' && c <= 'z') {
+      sendUsbKeyPress(HID_KEY_A + (c - 'a'));
+    } else if (c >= 'A' && c <= 'Z') {
+      sendUsbKeyPressWithModifiers(HID_KEY_A + (c - 'A'), false, false, true, false);
+    } else if (c >= '0' && c <= '9') {
+      sendUsbKeyPress(HID_KEY_1 + (c - '1'));
+    } else if (c == ' ') {
+      sendUsbKeyPress(HID_KEY_SPACE);
+    } else if (c == '\n') {
+      sendUsbKeyPress(HID_KEY_ENTER);
+    }
+    delay(30);
+  }
+}
+
+// ====================== 远控模式：蓝牙 HID ======================
+void sendBleKeyPress(uint8_t keycode) {
+  if (!bleReady || !bleKeyboard.isConnected()) return;
+  bleKeyboard.write(keycode);
+}
+
+void sendBleKeyPressWithModifiers(uint8_t keycode, bool ctrl, bool alt, bool shift, bool gui) {
+  if (!bleReady || !bleKeyboard.isConnected()) return;
+  
+  uint8_t modifiers = 0;
+  if (ctrl)  modifiers |= 0x01;
+  if (shift) modifiers |= 0x02;
+  if (alt)   modifiers |= 0x04;
+  if (gui)   modifiers |= 0x08;
+  
+  bleKeyboard.sendReport((KeyReport){modifiers, 0, keycode, 0, 0, 0});
+  delay(50);
+  bleKeyboard.sendReport((KeyReport){0, 0, 0, 0, 0, 0});
+}
+
+void sendBleString(const char* str) {
+  if (!bleReady || !bleKeyboard.isConnected()) return;
+  bleKeyboard.print(str);
+}
+
+// ====================== 统一远控发送接口 ======================
+void sendRemoteKeyPress(uint8_t keycode) {
+  if (usbHidReady) {
+    sendUsbKeyPress(keycode);
+  } else if (bleReady && bleKeyboard.isConnected()) {
+    sendBleKeyPress(keycode);
+  }
+}
+
+void sendRemoteKeyPressWithModifiers(uint8_t keycode, bool ctrl, bool alt, bool shift, bool gui) {
+  if (usbHidReady) {
+    sendUsbKeyPressWithModifiers(keycode, ctrl, alt, shift, gui);
+  } else if (bleReady && bleKeyboard.isConnected()) {
+    sendBleKeyPressWithModifiers(keycode, ctrl, alt, shift, gui);
+  }
+}
+
+void sendRemoteString(const char* str) {
+  if (usbHidReady) {
+    sendUsbString(str);
+  } else if (bleReady && bleKeyboard.isConnected()) {
+    sendBleString(str);
+  }
+}
+
+// ====================== WebSocket 命令处理 ======================
+void handleRemoteCommand(JsonObject& cmd) {
+  String type = cmd["type"];
+  
+  if (type == "key") {
+    String keyName = cmd["key"];
+    for (int i = 0; i < keyMapSize; i++) {
+      if (keyName == keyMap[i].name) {
+        sendRemoteKeyPress(keyMap[i].key);
+        break;
+      }
+    }
+  }
+  else if (type == "char") {
+    String ch = cmd["char"];
+    if (ch.length() == 1) {
+      char c = ch[0];
+      if (c >= 'a' && c <= 'z') {
+        sendRemoteKeyPress(HID_KEY_A + (c - 'a'));
+      } else if (c >= 'A' && c <= 'Z') {
+        sendRemoteKeyPressWithModifiers(HID_KEY_A + (c - 'A'), false, false, true, false);
+      } else if (c >= '0' && c <= '9') {
+        sendRemoteKeyPress(HID_KEY_1 + (c - '1'));
+      } else if (c == ' ') {
+        sendRemoteKeyPress(HID_KEY_SPACE);
+      } else if (c == '\n') {
+        sendRemoteKeyPress(HID_KEY_ENTER);
+      }
+    }
+  }
+  else if (type == "text") {
+    String text = cmd["text"];
+    sendRemoteString(text.c_str());
+  }
+  else if (type == "modifier") {
+    String mod = cmd["modifier"];
+    bool pressed = cmd["pressed"];
+    if (mod == "ctrl") ctrlPressed = pressed;
+    else if (mod == "alt") altPressed = pressed;
+    else if (mod == "shift") shiftPressed = pressed;
+    else if (mod == "gui") guiPressed = pressed;
+  }
+  else if (type == "combined") {
+    String keyName = cmd["key"];
+    uint8_t keyCode = 0;
+    if (keyName == "c") keyCode = HID_KEY_C;
+    else if (keyName == "v") keyCode = HID_KEY_V;
+    else if (keyName == "x") keyCode = HID_KEY_X;
+    else if (keyName == "a") keyCode = HID_KEY_A;
+    else if (keyName == "z") keyCode = HID_KEY_Z;
+    else if (keyName == "r") keyCode = HID_KEY_R;
+    
+    if (keyCode != 0) {
+      sendRemoteKeyPressWithModifiers(keyCode, ctrlPressed, altPressed, shiftPressed, guiPressed);
+    }
+  }
+  else if (type == "media") {
+    String mediaKey = cmd["media"];
+    if (mediaKey == "volup") sendRemoteKeyPress(HID_KEY_VOLUME_UP);
+    else if (mediaKey == "voldown") sendRemoteKeyPress(HID_KEY_VOLUME_DOWN);
+    else if (mediaKey == "mute") sendRemoteKeyPress(HID_KEY_MUTE);
+    else if (mediaKey == "playpause") sendRemoteKeyPress(HID_KEY_PLAY_PAUSE);
+    else if (mediaKey == "next") sendRemoteKeyPress(HID_KEY_NEXT_TRACK);
+    else if (mediaKey == "prev") sendRemoteKeyPress(HID_KEY_PREVIOUS_TRACK);
+  }
+}
+
+// ====================== WebSocket 事件 ======================
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  switch(type) {
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Client %u connected\n", num);
+      break;
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] Client %u disconnected\n", num);
+      break;
+    case WStype_TEXT:
       {
-        id: 1, author: 'admin', authorNickname: '工会理事',
-        title: '欢迎来到PCB设计工会',
-        content: '这是一个专注于PCB设计的社区，欢迎各位工程师交流讨论！',
-        date: '2024-01-15', timestamp: Date.now()
+        String jsonStr = String((char*)payload);
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, jsonStr);
+        if (!error && currentWorkMode == MODE_REMOTE) {
+          handleRemoteCommand(doc.as<JsonObject>());
+        }
       }
-    ],
-    marketItems: [],
-    discussMessages: [
-      { user: '工会理事', text: '欢迎进入PCB设计讨论室', time: '09:00', timestamp: Date.now() }
-    ],
-    discussAccessUsers: ['admin', 'engineer_lee'],
-    messageRetentionHours: 24,
-    introContent: '<h2 style="background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:1.8rem;margin-bottom:16px">⚡ PCB设计工会</h2><p style="font-size:1.1rem;line-height:1.8;color:#94a3b8">我们致力于<strong style="color:#60a5fa">高频/高速PCB设计</strong>、<strong style="color:#a78bfa">信号完整性分析</strong>、<strong style="color:#f472b6">EMC设计</strong>等专业领域。</p><p style="margin-top:12px;padding:12px 20px;background:rgba(96,165,250,0.1);border-radius:12px;border-left:3px solid #60a5fa;color:#93c5fd"><strong>🔐 管理员发布账号，不支持自主注册。</strong></p>'
-  };
+      break;
+  }
 }
 
-// ============ 前端 HTML（全新 UI） ============
+// ====================== WiFi 网络管理 ======================
+void startAPMode() {
+  currentNetMode = MODE_AP;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  Serial.printf("[NET] AP mode, IP: %s\n", WiFi.softAPIP().toString());
+}
 
-function getHTML() {
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PCB设计工会 · 极域</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
+bool tryConnectWiFi(int index) {
+  if (index >= savedNetworkCount) return false;
+  
+  String ssid = savedNetworks[index].ssid;
+  String pwd = savedNetworks[index].password;
+  Serial.printf("[NET] Connecting to %s\n", ssid.c_str());
+  
+  WiFi.begin(ssid.c_str(), pwd.c_str());
+  
+  unsigned long start = millis();
+  while (millis() - start < 10000) {
+    if (WiFi.status() == WL_CONNECTED) {
+      currentNetMode = MODE_WIFI_CLIENT;
+      Serial.printf("[NET] Connected, IP: %s\n", WiFi.localIP().toString());
+      return true;
+    }
+    delay(200);
+  }
+  return false;
+}
+
+void connectToBestWiFi() {
+  if (savedNetworkCount == 0) {
+    startAPMode();
+    return;
+  }
+  
+  for (int i = 0; i < savedNetworkCount; i++) {
+    if (tryConnectWiFi(i)) return;
+  }
+  
+  startAPMode();
+}
+
+// ====================== 模式切换 ======================
+void switchWorkMode(WorkMode newMode) {
+  if (currentWorkMode == newMode) return;
+  
+  currentWorkMode = newMode;
+  prefs.putInt("work_mode", newMode);
+  Serial.printf("[MODE] Switched to %s\n", newMode == MODE_PRINTER ? "Printer" : "Remote");
+  
+  if (newMode == MODE_PRINTER) {
+    // 切换到打印模式，重新初始化 USB Host 检测打印机
+    if (!deviceConnected && clientHandle) {
+      // 触发重新检测
+    }
+  }
+}
+
+// ====================== 网页服务器 ======================
+void setupWebServer() {
+  server.on("/", HTTP_GET, []() {
+    String modeClass = (currentWorkMode == MODE_PRINTER) ? "printer" : "remote";
     
-    :root{
-      --bg-primary:#0f172a;
-      --bg-secondary:#1e293b;
-      --bg-card:rgba(30,41,59,0.8);
-      --bg-input:rgba(15,23,42,0.6);
-      --text-primary:#f1f5f9;
-      --text-secondary:#94a3b8;
-      --text-muted:#64748b;
-      --accent-blue:#60a5fa;
-      --accent-purple:#a78bfa;
-      --accent-pink:#f472b6;
-      --accent-cyan:#22d3ee;
-      --gradient-1:linear-gradient(135deg,#60a5fa,#a78bfa);
-      --gradient-2:linear-gradient(135deg,#a78bfa,#f472b6);
-      --gradient-3:linear-gradient(135deg,#60a5fa,#22d3ee);
-      --border:rgba(148,163,184,0.1);
-      --shadow:0 8px 32px rgba(0,0,0,0.3);
-      --shadow-lg:0 20px 60px rgba(0,0,0,0.5);
-      --radius:16px;
-      --radius-sm:10px;
-      --radius-lg:24px;
-      --transition:all 0.3s cubic-bezier(0.4,0,0.2,1);
-    }
-
-    body{
-      font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
-      background:var(--bg-primary);
-      background-image:
-        radial-gradient(ellipse at 20% 20%,rgba(96,165,250,0.08) 0%,transparent 50%),
-        radial-gradient(ellipse at 80% 80%,rgba(167,139,250,0.08) 0%,transparent 50%),
-        radial-gradient(ellipse at 50% 50%,rgba(244,114,182,0.05) 0%,transparent 50%);
-      color:var(--text-primary);
-      min-height:100vh;
-      display:flex;
-      justify-content:center;
-      align-items:center;
-      padding:16px;
-      line-height:1.6;
-    }
-
-    .app-container{
-      width:100%;
-      max-width:1400px;
-      height:92vh;
-      max-height:950px;
-      background:var(--bg-secondary);
-      backdrop-filter:blur(40px);
-      -webkit-backdrop-filter:blur(40px);
-      border-radius:var(--radius-lg);
-      display:flex;
-      flex-direction:column;
-      overflow:hidden;
-      border:1px solid var(--border);
-      box-shadow:var(--shadow-lg);
-    }
-
-    /* 导航栏 */
-    .navbar{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      padding:16px 28px;
-      background:rgba(15,23,42,0.6);
-      backdrop-filter:blur(20px);
-      border-bottom:1px solid var(--border);
-      flex-shrink:0;
-      gap:16px;
-    }
-
-    .logo-area{
-      display:flex;
-      align-items:center;
-      gap:12px;
-    }
-
-    .logo-icon{
-      width:44px;
-      height:44px;
-      background:var(--gradient-1);
-      border-radius:14px;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      font-size:22px;
-      color:white;
-      box-shadow:0 4px 15px rgba(96,165,250,0.3);
-    }
-
-    .logo-text{
-      font-weight:800;
-      font-size:1.4rem;
-      background:var(--gradient-1);
-      -webkit-background-clip:text;
-      -webkit-text-fill-color:transparent;
-      background-clip:text;
-      letter-spacing:-0.5px;
-    }
-
-    .nav-links{
-      display:flex;
-      gap:4px;
-      background:rgba(15,23,42,0.5);
-      padding:4px;
-      border-radius:40px;
-      border:1px solid var(--border);
-    }
-
-    .nav-item{
-      padding:10px 22px;
-      border-radius:30px;
-      font-weight:500;
-      font-size:0.9rem;
-      color:var(--text-secondary);
-      cursor:pointer;
-      border:none;
-      background:transparent;
-      display:flex;
-      align-items:center;
-      gap:8px;
-      transition:var(--transition);
-      white-space:nowrap;
-    }
-
-    .nav-item:hover{color:var(--accent-blue);}
+    String html = "<!DOCTYPE html><html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<title>ESP32 双模式桥接器</title>";
+    html += "<style>";
+    html += "*{margin:0;padding:0;box-sizing:border-box;}";
+    html += "body{font-family:'Segoe UI',Arial,sans-serif;background:linear-gradient(135deg,#1a1a2e,#16213e);min-height:100vh;color:#eee;}";
+    html += ".container{max-width:1200px;margin:0 auto;padding:20px;}";
+    html += "h1{text-align:center;margin-bottom:30px;color:#00d4ff;}";
+    html += ".mode-switch{display:flex;justify-content:center;gap:20px;margin-bottom:30px;}";
+    html += ".mode-btn{padding:12px 30px;font-size:18px;border:none;border-radius:30px;cursor:pointer;transition:all 0.3s;background:#2c3e50;color:#ecf0f1;}";
+    html += ".mode-btn.printer.active{background:#27ae60;box-shadow:0 0 15px #27ae60;}";
+    html += ".mode-btn.remote.active{background:#e67e22;box-shadow:0 0 15px #e67e22;}";
+    html += ".card{background:rgba(255,255,255,0.1);backdrop-filter:blur(10px);border-radius:15px;padding:20px;margin-bottom:20px;}";
+    html += ".card h3{margin-bottom:15px;color:#00d4ff;}";
+    html += ".status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;}";
+    html += ".status-item{background:rgba(0,0,0,0.3);padding:12px;border-radius:8px;}";
+    html += ".status-label{font-size:12px;color:#aaa;}";
+    html += ".status-value{font-size:18px;font-weight:bold;}";
+    html += ".online{color:#2ecc71;}";
+    html += ".offline{color:#e74c3c;}";
+    html += "table{width:100%;border-collapse:collapse;}";
+    html += "td,th{padding:10px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.1);}";
+    html += "button{padding:6px 12px;border:none;border-radius:5px;cursor:pointer;transition:0.2s;}";
+    html += "button.primary{background:#3498db;color:white;}";
+    html += "button.danger{background:#e74c3c;color:white;}";
+    html += "button.warning{background:#f39c12;color:white;}";
+    html += "input,select{padding:8px;border-radius:5px;border:1px solid #555;background:#2c3e50;color:white;}";
+    html += ".remote-panel{display:" + String(currentWorkMode == MODE_REMOTE ? "block" : "none") + ";}";
+    html += ".printer-panel{display:" + String(currentWorkMode == MODE_PRINTER ? "block" : "none") + ";}";
+    html += ".keyboard{display:grid;grid-template-columns:repeat(10,1fr);gap:8px;margin-top:15px;}";
+    html += ".key{background:#2c3e50;padding:12px;text-align:center;border-radius:8px;cursor:pointer;transition:0.1s;}";
+    html += ".key:active{background:#e67e22;transform:scale(0.95);}";
+    html += ".key.wide{grid-column:span 2;}";
+    html += ".modifier-row{display:flex;gap:10px;margin-bottom:15px;}";
+    html += ".modifier{background:#34495e;padding:10px 15px;border-radius:8px;cursor:pointer;}";
+    html += ".modifier.active{background:#e67e22;}";
+    html += ".text-input{display:flex;gap:10px;margin-bottom:15px;}";
+    html += ".text-input input{flex:1;}";
+    html += "@media(max-width:768px){.keyboard{grid-template-columns:repeat(5,1fr);}}";
+    html += "</style>";
     
-    .nav-item.active{
-      background:rgba(96,165,250,0.15);
-      color:var(--accent-blue);
-      font-weight:600;
-      box-shadow:0 2px 10px rgba(96,165,250,0.1);
-    }
-
-    .user-section{
-      display:flex;
-      align-items:center;
-      gap:12px;
-      flex-shrink:0;
-    }
-
-    .btn{
-      padding:10px 20px;
-      border-radius:30px;
-      font-weight:600;
-      cursor:pointer;
-      border:none;
-      display:flex;
-      align-items:center;
-      gap:8px;
-      font-size:0.9rem;
-      transition:var(--transition);
-      font-family:inherit;
-    }
-
-    .btn-primary{
-      background:var(--gradient-1);
-      color:white;
-      box-shadow:0 4px 15px rgba(96,165,250,0.3);
-    }
-    .btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(96,165,250,0.4);}
-
-    .btn-danger{
-      background:rgba(239,68,68,0.15);
-      color:#f87171;
-      border:1px solid rgba(239,68,68,0.2);
-    }
-    .btn-danger:hover{background:rgba(239,68,68,0.25);}
-
-    .btn-outline{
-      background:transparent;
-      border:1px solid var(--border);
-      color:var(--text-secondary);
-    }
-    .btn-outline:hover{border-color:var(--accent-blue);color:var(--accent-blue);}
-
-    .btn-sm{padding:6px 14px;font-size:0.8rem;}
-
-    .user-badge{
-      display:flex;
-      align-items:center;
-      gap:10px;
-      background:rgba(96,165,250,0.1);
-      padding:8px 16px;
-      border-radius:30px;
-      border:1px solid rgba(96,165,250,0.2);
-      cursor:pointer;
-      transition:var(--transition);
-    }
-    .user-badge:hover{border-color:var(--accent-blue);background:rgba(96,165,250,0.15);}
-
-    .admin-badge{
-      background:var(--gradient-2);
-      color:white;
-      padding:3px 10px;
-      border-radius:20px;
-      font-size:0.7rem;
-      font-weight:700;
-      letter-spacing:0.5px;
-    }
-
-    .main-content{
-      flex:1;
-      padding:24px;
-      overflow-y:auto;
-    }
-
-    .main-content::-webkit-scrollbar{width:6px;}
-    .main-content::-webkit-scrollbar-track{background:transparent;}
-    .main-content::-webkit-scrollbar-thumb{background:rgba(148,163,184,0.2);border-radius:10px;}
-    .main-content::-webkit-scrollbar-thumb:hover{background:rgba(148,163,184,0.4);}
-
-    /* 卡片 */
-    .card{
-      background:var(--bg-card);
-      border-radius:var(--radius);
-      padding:28px;
-      border:1px solid var(--border);
-      backdrop-filter:blur(20px);
-      animation:fadeIn 0.4s ease;
-      margin-bottom:16px;
-    }
-
-    @keyframes fadeIn{from{opacity:0;transform:translateY(15px)}to{opacity:1;transform:translateY(0)}}
-
-    .section-title{
-      font-size:1.4rem;
-      font-weight:700;
-      margin-bottom:24px;
-      display:flex;
-      align-items:center;
-      gap:12px;
-    }
-    .section-title i{background:var(--gradient-1);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
-
-    .flex-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px;}
-
-    .input,.textarea{
-      background:var(--bg-input);
-      border:1px solid var(--border);
-      border-radius:var(--radius-sm);
-      padding:12px 16px;
-      font-family:inherit;
-      font-size:0.95rem;
-      color:var(--text-primary);
-      outline:none;
-      flex:1;
-      min-width:150px;
-      transition:var(--transition);
-    }
-    .input:focus,.textarea:focus{border-color:var(--accent-blue);box-shadow:0 0 0 3px rgba(96,165,250,0.15);}
-    .input::placeholder,.textarea::placeholder{color:var(--text-muted);}
-    .textarea{resize:vertical;min-height:80px;}
-
-    /* 列表项 */
-    .list-item{
-      background:rgba(15,23,42,0.4);
-      border-radius:var(--radius-sm);
-      padding:18px;
-      margin-bottom:10px;
-      border:1px solid var(--border);
-      display:flex;
-      justify-content:space-between;
-      align-items:flex-start;
-      gap:12px;
-      transition:var(--transition);
-    }
-    .list-item:hover{border-color:rgba(96,165,250,0.3);background:rgba(15,23,42,0.6);}
-    .list-item-content{flex:1;}
-    .list-item-title{font-weight:600;color:var(--text-primary);margin-bottom:6px;font-size:1.05rem;}
-    .list-item-meta{font-size:0.85rem;color:var(--text-muted);}
-    .list-item-author{color:var(--accent-blue);font-weight:500;}
-
-    /* 聊天 */
-    .chat-box{
-      height:350px;
-      overflow-y:auto;
-      background:rgba(15,23,42,0.5);
-      border-radius:var(--radius-sm);
-      padding:16px;
-      margin:16px 0;
-      border:1px solid var(--border);
-    }
-    .chat-box::-webkit-scrollbar{width:4px;}
-    .chat-box::-webkit-scrollbar-thumb{background:rgba(148,163,184,0.3);border-radius:10px;}
-
-    .msg-bubble{
-      background:rgba(96,165,250,0.08);
-      padding:10px 16px;
-      border-radius:14px;
-      margin-bottom:8px;
-      border:1px solid rgba(96,165,250,0.1);
-      display:inline-block;
-      max-width:85%;
-    }
-    .msg-user{font-weight:600;color:var(--accent-blue);font-size:0.9rem;}
-    .msg-time{font-size:0.7rem;color:var(--text-muted);margin-left:8px;}
-    .msg-text{color:var(--text-secondary);margin-top:4px;}
-
-    /* 管理面板 */
-    .admin-panel{
-      background:rgba(167,139,250,0.05);
-      border:1px solid rgba(167,139,250,0.15);
-      border-radius:var(--radius-sm);
-      padding:20px;
-      margin-top:20px;
-    }
-    .admin-panel h4{margin-bottom:14px;color:var(--accent-purple);font-size:0.95rem;}
-
-    .user-list-item{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      padding:12px 16px;
-      background:rgba(15,23,42,0.5);
-      border-radius:var(--radius-sm);
-      margin-bottom:8px;
-      border:1px solid var(--border);
-    }
-    .user-list-info{display:flex;align-items:center;gap:12px;}
-    .user-avatar{
-      width:38px;
-      height:38px;
-      border-radius:50%;
-      background:var(--gradient-2);
-      color:white;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      font-weight:700;
-      font-size:0.9rem;
-    }
-
-    /* 模态框 */
-    .modal-overlay{
-      position:fixed;
-      top:0;left:0;right:0;bottom:0;
-      background:rgba(0,0,0,0.7);
-      backdrop-filter:blur(6px);
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      z-index:1000;
-      animation:fadeIn 0.2s ease;
-    }
-    .modal{
-      background:var(--bg-secondary);
-      border-radius:var(--radius-lg);
-      padding:32px;
-      width:90%;
-      max-width:480px;
-      border:1px solid var(--border);
-      box-shadow:var(--shadow-lg);
-      animation:slideUp 0.3s ease;
-    }
-    @keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
-    .modal h3{margin-bottom:20px;font-size:1.3rem;}
-
-    .modal label{display:block;font-size:0.9rem;color:var(--text-secondary);margin-bottom:6px;}
-    .modal .input{margin-bottom:14px;}
-
-    .modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:24px;}
-
-    /* Toast */
-    .toast{
-      position:fixed;
-      top:20px;
-      right:20px;
-      padding:14px 24px;
-      background:var(--bg-secondary);
-      border-radius:var(--radius-sm);
-      border:1px solid var(--border);
-      box-shadow:var(--shadow);
-      z-index:1001;
-      font-weight:500;
-      animation:slideIn 0.3s ease;
-    }
-    @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
-    .toast.error{border-left:3px solid #f87171;color:#f87171;}
-    .toast.success{border-left:3px solid #34d399;color:#34d399;}
-
-    .empty-state{text-align:center;padding:60px 20px;color:var(--text-muted);}
-    .empty-state i{font-size:3.5rem;margin-bottom:16px;opacity:0.3;}
-
-    /* 日志表格 */
-    .log-table{width:100%;border-collapse:collapse;font-size:0.85rem;}
-    .log-table th{text-align:left;padding:10px 12px;color:var(--accent-cyan);border-bottom:1px solid var(--border);font-weight:600;}
-    .log-table td{padding:10px 12px;border-bottom:1px solid rgba(148,163,184,0.05);color:var(--text-secondary);}
-    .log-table tr:hover td{background:rgba(96,165,250,0.03);}
-
-    .badge{
-      display:inline-block;
-      padding:3px 10px;
-      border-radius:20px;
-      font-size:0.75rem;
-      font-weight:600;
-    }
-    .badge-info{background:rgba(96,165,250,0.15);color:var(--accent-blue);}
-    .badge-danger{background:rgba(239,68,68,0.15);color:#f87171;}
-    .badge-success{background:rgba(52,211,153,0.15);color:#34d399;}
-
-    @media(max-width:768px){
-      .navbar{flex-direction:column;padding:12px;}
-      .nav-links{width:100%;justify-content:center;overflow-x:auto;}
-      .nav-item{padding:8px 14px;font-size:0.8rem;}
-      .main-content{padding:14px;}
-      .card{padding:18px;}
-      .list-item{flex-direction:column;}
-      .modal{width:95%;padding:20px;}
-    }
-  </style>
-</head>
-<body>
-<div class="app-container">
-  <div class="navbar">
-    <div class="logo-area">
-      <div class="logo-icon"><i class="fas fa-microchip"></i></div>
-      <span class="logo-text">PCB·设计工会</span>
-    </div>
-    <div class="nav-links" id="navLinks">
-      <button class="nav-item active" data-view="intro"><i class="fas fa-info-circle"></i>介绍</button>
-      <button class="nav-item" data-view="posts"><i class="fas fa-comments"></i>帖子</button>
-      <button class="nav-item" data-view="market"><i class="fas fa-store"></i>市集</button>
-      <button class="nav-item" data-view="discuss"><i class="fas fa-comment-dots"></i>讨论</button>
-    </div>
-    <div class="user-section" id="userSection"></div>
-  </div>
-  <div class="main-content" id="mainContent"><div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>正在加载极域...</p></div></div>
-</div>
-
-<script>
-const API="/api/state";
-let state=null,currentUser=null,authToken=null,isRefreshing=false;
-
-function escapeHtml(str){
-  if(!str)return"";
-  return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");
-}
-
-function showToast(msg,type="success"){
-  const old=document.querySelector(".toast");
-  if(old)old.remove();
-  const toast=document.createElement("div");
-  toast.className="toast "+type;
-  toast.innerHTML='<i class="fas '+(type==="success"?"fa-check-circle":"fa-exclamation-circle")+'"></i> '+escapeHtml(msg);
-  document.body.appendChild(toast);
-  setTimeout(()=>toast.remove(),3000);
-}
-
-async function apiCall(action,payload={}){
-  const body={token:authToken,action,payload};
-  try{
-    const res=await fetch(API,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-    const data=await res.json();
-    if(data.error){showToast(data.error,"error");return null}
-    if(data.token)authToken=data.token;
-    return data;
-  }catch(e){showToast("网络错误","error");return null}
-}
-
-async function loadState(){
-  try{
-    const res=await fetch(API);
-    state=await res.json();
-    renderApp();
-  }catch(e){document.getElementById("mainContent").innerHTML='<div class="card"><p style="color:#f87171">加载失败，请刷新</p></div>'}
-}
-
-async function login(username,password){
-  const result=await apiCall("login",{username,password});
-  if(result&&result.user){currentUser=result.user;authToken=result.token;renderApp();showToast("欢迎回来，"+escapeHtml(result.user.nickname))}
-}
-
-function logout(){currentUser=null;authToken=null;renderApp()}
-
-function showProfileModal(){
-  const modal=document.createElement("div");modal.className="modal-overlay";modal.id="profileModal";
-  modal.innerHTML='<div class="modal"><h3><i class="fas fa-user-edit"></i> 编辑个人信息</h3><p style="color:var(--text-muted);margin-bottom:16px">当前账号: <strong style="color:var(--accent-blue)">'+escapeHtml(currentUser.username)+'</strong></p><label>新昵称</label><input class="input" id="editNickname" value="'+escapeHtml(currentUser.nickname)+'"><label>新密码（留空不修改）</label><input class="input" id="editPassword" type="password" placeholder="输入新密码"><div class="modal-actions"><button class="btn btn-outline" onclick="closeProfileModal()">取消</button><button class="btn btn-primary" onclick="saveProfile()">保存</button></div></div>';
-  document.body.appendChild(modal);
-  modal.addEventListener("click",e=>{if(e.target===modal)closeProfileModal()});
-}
-function closeProfileModal(){const m=document.getElementById("profileModal");if(m)m.remove()}
-async function saveProfile(){
-  const nn=document.getElementById("editNickname").value.trim();
-  const np=document.getElementById("editPassword").value.trim();
-  if(!nn&&!np){showToast("没有要修改的内容","error");return}
-  const r=await apiCall("updateProfile",{newNickname:nn,newPassword:np});
-  if(r){if(nn)currentUser.nickname=nn;if(r.token)authToken=r.token;state=r.state;closeProfileModal();renderApp();showToast("个人信息已更新")}
-}
-
-function showUserManagementModal(){
-  const modal=document.createElement("div");modal.className="modal-overlay";modal.id="umModal";
-  let list="";
-  state.users.forEach(u=>{list+='<div class="user-list-item"><div class="user-list-info"><div class="user-avatar">'+escapeHtml(u.nickname.charAt(0).toUpperCase())+'</div><div><strong>'+escapeHtml(u.nickname)+'</strong><span style="color:var(--text-muted);font-size:.85rem;margin-left:4px">@'+escapeHtml(u.username)+'</span>'+(u.role==="admin"?'<span class="admin-badge" style="margin-left:8px">管理员</span>':"")+'</div></div>'+(u.username!=="admin"?'<button class="btn btn-danger btn-sm" onclick="deleteUserAccount(\''+escapeHtml(u.username)+'\')"><i class="fas fa-trash"></i> 删除</button>':'<span style="color:var(--text-muted);font-size:.8rem">不可删除</span>')+"</div>"});
-  modal.innerHTML='<div class="modal" style="max-width:550px"><h3><i class="fas fa-users-cog"></i> 用户管理</h3><p style="color:var(--text-muted);margin-bottom:16px">共 <strong style="color:var(--accent-blue)">'+state.users.length+'</strong> 个用户</p><div style="max-height:400px;overflow-y:auto">'+list+'</div><div class="modal-actions"><button class="btn btn-outline" onclick="closeUmModal()">关闭</button></div></div>';
-  document.body.appendChild(modal);
-  modal.addEventListener("click",e=>{if(e.target===modal)closeUmModal()});
-}
-function closeUmModal(){const m=document.getElementById("umModal");if(m)m.remove()}
-async function deleteUserAccount(username){
-  if(!confirm("确定删除用户 \\""+username+"\\" 吗？"))return;
-  const r=await apiCall("deleteUser",{username});
-  if(r){state=r.state;closeUmModal();renderApp();showToast("用户 "+username+" 已删除")}
-}
-
-async function showLogsModal(){
-  const result=await apiCall("getLogs");
-  if(!result)return;
-  const logs=result.logs||[];
-  let table='<table class="log-table"><thead><tr><th>时间</th><th>操作</th><th>用户</th><th>详情</th></tr></thead><tbody>';
-  logs.forEach(l=>{
-    let badgeClass="badge-info";
-    if(l.action.includes("删除")||l.action.includes("撤销")||l.action.includes("清空"))badgeClass="badge-danger";
-    else if(l.action.includes("登录")||l.action.includes("添加")||l.action.includes("授予"))badgeClass="badge-success";
-    table+='<tr><td>'+escapeHtml(l.time)+'</td><td><span class="badge '+badgeClass+'">'+escapeHtml(l.action)+'</span></td><td>'+escapeHtml(l.username)+'</td><td style="font-size:0.8rem">'+escapeHtml(l.detail||"-")+'</td></tr>';
+    html += "<script>";
+    html += "let ws=null;let currentMode='" + modeClass + "';";
+    html += "function connectWS(){if(currentMode==='remote'){ws=new WebSocket('ws://'+window.location.hostname+':81');ws.onopen=()=>console.log('WS connected');ws.onclose=()=>setTimeout(connectWS,3000);}}";
+    html += "function sendCommand(cmd){if(ws&&ws.readyState===WebSocket.OPEN){ws.send(JSON.stringify(cmd));}}";
+    html += "function sendKey(key){sendCommand({type:'key',key:key});}";
+    html += "function sendChar(ch){sendCommand({type:'char',char:ch});}";
+    html += "function sendText(){let t=document.getElementById('textInput').value;if(t){sendCommand({type:'text',text:t});document.getElementById('textInput').value='';}}";
+    html += "function toggleModifier(mod){let btn=document.getElementById('mod_'+mod);let active=btn.classList.toggle('active');sendCommand({type:'modifier',modifier:mod,pressed:active});}";
+    html += "function sendCombined(key){sendCommand({type:'combined',key:key});}";
+    html += "function sendMedia(key){sendCommand({type:'media',media:key});}";
+    html += "function switchMode(mode){fetch('/api/mode?mode='+mode).then(()=>{setTimeout(()=>location.reload(),500);});}";
+    html += "function reboot(){if(confirm('Reboot device?'))fetch('/api/reboot');}";
+    html += "function scanWiFi(){fetch('/api/scan').then(()=>setTimeout(loadWiFiList,5000));loadWiFiList();}";
+    html += "function loadWiFiList(){fetch('/api/networks').then(r=>r.json()).then(data=>{let html='<table><tr><th>SSID</th><th>Signal</th><th>Action</th></tr>';data.forEach(n=>{if(n.ssid)html+=`<tr><td>${n.ssid}</td><td>${n.rssi}dBm</td><td><button onclick='connectWiFi(\"${n.ssid}\")'>Connect</button></td>`;});html+='</table>';document.getElementById('wifiList').innerHTML=html;});}";
+    html += "function connectWiFi(ssid){let pwd=prompt('Password for '+ssid+':');if(pwd){fetch('/api/wifi/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ssid,password:pwd})}).then(()=>{alert('Added, rebooting...');setTimeout(()=>location.reload(),3000);});}}";
+    html += "function addWiFi(){let ssid=document.getElementById('newSsid').value;let pwd=document.getElementById('newPwd').value;if(ssid){fetch('/api/wifi/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ssid,password:pwd})}).then(()=>location.reload());}}";
+    html += "function clearWiFi(){if(confirm('Clear all WiFi?')){fetch('/api/wifi/clear').then(()=>location.reload());}}";
+    html += "setInterval(()=>{fetch('/api/status').then(r=>r.json()).then(d=>{document.getElementById('mode_display').innerText=d.mode==='printer'?'🖨️ Printer':'🎮 Remote';document.getElementById('device_status').innerHTML=d.printer_ready?'🖨️ Printer Ready':'🎮 Remote Ready';document.getElementById('ip_display').innerText=d.ip;document.getElementById('wifi_display').innerText=d.ssid;document.getElementById('heap_display').innerText=d.heap;});},3000);";
+    html += "window.onload=()=>{connectWS();loadWiFiList();};";
+    html += "</script>";
+    html += "</head><body>";
+    html += "<div class='container'>";
+    html += "<h1>🔌 ESP32-S3 双模式桥接器 v5.0</h1>";
+    
+    // 模式切换按钮
+    html += "<div class='mode-switch'>";
+    html += "<button class='mode-btn printer" + String(currentWorkMode == MODE_PRINTER ? " active" : "") + "' onclick='switchMode(\"printer\")'>🖨️ 打印模式</button>";
+    html += "<button class='mode-btn remote" + String(currentWorkMode == MODE_REMOTE ? " active" : "") + "' onclick='switchMode(\"remote\")'>🎮 远控模式</button>";
+    html += "</div>";
+    
+    // 状态卡片
+    html += "<div class='card'><h3>📊 系统状态</h3><div class='status-grid'>";
+    html += "<div class='status-item'><div class='status-label'>工作模式</div><div class='status-value' id='mode_display'>-</div></div>";
+    html += "<div class='status-item'><div class='status-label'>设备状态</div><div class='status-value' id='device_status'>-</div></div>";
+    html += "<div class='status-item'><div class='status-label'>IP地址</div><div class='status-value' id='ip_display'>-</div></div>";
+    html += "<div class='status-item'><div class='status-label'>WiFi</div><div class='status-value' id='wifi_display'>-</div></div>";
+    html += "<div class='status-item'><div class='status-label'>空闲内存</div><div class='status-value' id='heap_display'>-</div></div>";
+    html += "</div></div>";
+    
+    // 打印模式面板
+    html += "<div class='printer-panel'><div class='card'><h3>🖨️ 打印模式</h3>";
+    html += "<p>打印机 RAW 端口：<strong>" + String(PRINT_PORT) + "</strong></p>";
+    html += "<p>Windows 添加打印机：</p><ol><li>控制面板 → 设备和打印机 → 添加打印机</li>";
+    html += "<li>选择「通过手动设置添加本地打印机或网络打印机」</li>";
+    html += "<li>创建新端口 → Standard TCP/IP Port → 输入 ESP32 IP 地址</li>";
+    html += "<li>端口号：<strong>" + String(PRINT_PORT) + "</strong> → 选择你的打印机驱动完成</li></ol>";
+    html += "</div></div>";
+    
+    // 远控模式面板
+    html += "<div class='remote-panel'><div class='card'><h3>🎮 远控模式</h3>";
+    html += "<div class='modifier-row'>";
+    html += "<div class='modifier' id='mod_ctrl' onclick='toggleModifier(\"ctrl\")'>Ctrl</div>";
+    html += "<div class='modifier' id='mod_alt' onclick='toggleModifier(\"alt\")'>Alt</div>";
+    html += "<div class='modifier' id='mod_shift' onclick='toggleModifier(\"shift\")'>Shift</div>";
+    html += "<div class='modifier' id='mod_gui' onclick='toggleModifier(\"gui\")'>Win</div>";
+    html += "</div>";
+    html += "<div class='text-input'><input type='text' id='textInput' placeholder='输入文本后点击发送...'><button class='primary' onclick='sendText()'>📤 发送</button></div>";
+    html += "<div class='keyboard'>";
+    // 数字行
+    for(int i=1;i<=10;i++) html += "<div class='key' onclick='sendChar(\"" + String(i%10) + "\")'>" + String(i%10) + "</div>";
+    // 字母行
+    const char* keys[] = {"q","w","e","r","t","y","u","i","o","p","a","s","d","f","g","h","j","k","l","z","x","c","v","b","n","m"};
+    for(auto& k : keys) html += "<div class='key' onclick='sendChar(\"" + String(k) + "\")'>" + String(k) + "</div>";
+    // 功能键
+    const char* funcs[] = {"space","enter","tab","esc","backspace","del","up","down","left","right"};
+    for(auto& f : funcs) html += "<div class='key wide' onclick='sendKey(\"" + String(f) + "\")'>" + String(f) + "</div>";
+    html += "</div><div style='margin-top:15px;'><h4>🎵 媒体控制</h4><div class='keyboard'>";
+    const char* media[] = {"volup","voldown","mute","playpause","next","prev"};
+    for(auto& m : media) html += "<div class='key' onclick='sendMedia(\"" + String(m) + "\")'>" + String(m) + "</div>";
+    html += "</div></div>";
+    html += "<p style='margin-top:15px;'>💡 连接方式：<strong>" + String(usbHidReady ? "USB有线已连接" : (bleReady ? "蓝牙待配对" : "未就绪")) + "</strong></p>";
+    html += "</div></div>";
+    
+    // WiFi 管理卡片
+    html += "<div class='card'><h3>📶 WiFi 管理</h3><div id='wifiList'>加载中...</div>";
+    html += "<hr><div style='display:flex;gap:10px;margin-top:10px;'>";
+    html += "<input type='text' id='newSsid' placeholder='SSID'>";
+    html += "<input type='password' id='newPwd' placeholder='密码'>";
+    html += "<button class='primary' onclick='addWiFi()'>添加</button>";
+    html += "<button class='danger' onclick='clearWiFi()'>清空全部</button>";
+    html += "<button class='warning' onclick='scanWiFi()'>扫描</button>";
+    html += "</div></div>";
+    
+    html += "<div class='card'><button class='danger' onclick='reboot()'>🔄 重启设备</button></div>";
+    html += "</div></body></html>";
+    
+    server.send(200, "text/html", html);
   });
-  table+='</tbody></table>';
-  const modal=document.createElement("div");modal.className="modal-overlay";modal.id="logModal";
-  modal.innerHTML='<div class="modal" style="max-width:750px"><h3><i class="fas fa-history"></i> 操作日志</h3><div style="max-height:450px;overflow-y:auto">'+(logs.length?table:'<div class="empty-state"><i class="fas fa-inbox"></i><p>暂无日志</p></div>')+'</div><div class="modal-actions"><button class="btn btn-danger btn-sm" onclick="clearLogs()"><i class="fas fa-trash"></i> 清空日志</button><button class="btn btn-outline" onclick="closeLogModal()">关闭</button></div></div>';
-  document.body.appendChild(modal);
-  modal.addEventListener("click",e=>{if(e.target===modal)closeLogModal()});
-}
-function closeLogModal(){const m=document.getElementById("logModal");if(m)m.remove()}
-async function clearLogs(){if(!confirm("确定清空所有操作日志？"))return;const r=await apiCall("clearLogs");if(r){closeLogModal();showToast("日志已清空")}}
-
-function setupNav(){
-  document.getElementById("navLinks").addEventListener("click",e=>{
-    const btn=e.target.closest(".nav-item");
-    if(!btn)return;
-    document.querySelectorAll(".nav-item").forEach(b=>b.classList.remove("active"));
-    btn.classList.add("active");
-    renderView();
+  
+  // API: 获取状态
+  server.on("/api/status", HTTP_GET, []() {
+    StaticJsonDocument<256> doc;
+    doc["mode"] = currentWorkMode == MODE_PRINTER ? "printer" : "remote";
+    doc["printer_ready"] = printerReady;
+    doc["usb_hid_ready"] = usbHidReady;
+    doc["ble_ready"] = bleReady;
+    doc["ip"] = (currentNetMode == MODE_WIFI_CLIENT && WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    doc["ssid"] = (currentNetMode == MODE_WIFI_CLIENT && WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : AP_SSID;
+    doc["heap"] = ESP.getFreeHeap();
+    doc["ble_connected"] = bleReady ? bleKeyboard.isConnected() : false;
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
   });
-}
-
-function renderApp(){renderUserSection();renderView()}
-
-function renderUserSection(){
-  const sec=document.getElementById("userSection");
-  if(currentUser){
-    let html='<div class="user-badge" onclick="showProfileModal()"><i class="fas fa-user-circle"></i>'+escapeHtml(currentUser.nickname);
-    if(currentUser.role==="admin"){
-      html+='<span class="admin-badge">管理员</span>';
-      html+='<button class="btn btn-sm" onclick="event.stopPropagation();showUserManagementModal()" title="用户管理"><i class="fas fa-users-cog"></i></button>';
-      html+='<button class="btn btn-sm" onclick="event.stopPropagation();showLogsModal()" title="操作日志"><i class="fas fa-history"></i></button>';
+  
+  // API: 切换模式
+  server.on("/api/mode", HTTP_GET, []() {
+    if (server.hasArg("mode")) {
+      String mode = server.arg("mode");
+      if (mode == "printer") {
+        switchWorkMode(MODE_PRINTER);
+      } else if (mode == "remote") {
+        switchWorkMode(MODE_REMOTE);
+      }
+      server.send(200, "application/json", "{\"status\":\"ok\"}");
+    } else {
+      server.send(400, "application/json", "{\"status\":\"error\"}");
     }
-    html+='<button class="btn btn-sm" onclick="event.stopPropagation();logout()"><i class="fas fa-sign-out-alt"></i></button></div>';
-    sec.innerHTML=html;
-  }else{sec.innerHTML='<button class="btn btn-primary" onclick="showLogin()"><i class="fas fa-key"></i> 登录</button>'}
+  });
+  
+  // API: 扫描 WiFi
+  server.on("/api/scan", HTTP_GET, []() {
+    WiFi.scanNetworks(true);
+    server.send(200, "application/json", "{\"status\":\"scanning\"}");
+  });
+  
+  // API: 获取 WiFi 列表
+  server.on("/api/networks", HTTP_GET, []() {
+    int n = WiFi.scanComplete();
+    StaticJsonDocument<4096> doc;
+    JsonArray arr = doc.to<JsonArray>();
+    
+    if (n > 0) {
+      for (int i = 0; i < n && i < 30; i++) {
+        JsonObject obj = arr.createNestedObject();
+        obj["ssid"] = WiFi.SSID(i);
+        obj["rssi"] = WiFi.RSSI(i);
+        obj["encrypted"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+      }
+    }
+    
+    String response;
+    serializeJson(arr, response);
+    server.send(200, "application/json", response);
+  });
+  
+  // API: 添加 WiFi
+  server.on("/api/wifi/add", HTTP_POST, []() {
+    if (server.hasArg("plain")) {
+      StaticJsonDocument<256> doc;
+      DeserializationError error = deserializeJson(doc, server.arg("plain"));
+      if (!error) {
+        String ssid = doc["ssid"].as<String>();
+        String pwd = doc["password"].as<String>();
+        if (ssid.length() > 0) {
+          addWiFiNetwork(ssid, pwd);
+          server.send(200, "application/json", "{\"status\":\"ok\"}");
+          return;
+        }
+      }
+    }
+    server.send(400, "application/json", "{\"status\":\"error\"}");
+  });
+  
+  // API: 清空 WiFi
+  server.on("/api/wifi/clear", HTTP_GET, []() {
+    clearAllWiFi();
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
+  });
+  
+  // API: 重启
+  server.on("/api/reboot", HTTP_GET, []() {
+    server.send(200, "application/json", "{\"status\":\"rebooting\"}");
+    delay(100);
+    ESP.restart();
+  });
+  
+  server.begin();
+  Serial.println("[WEB] HTTP server started");
 }
 
-function showLogin(){
-  const username=prompt("请输入账号:");
-  if(!username)return;
-  const password=prompt("请输入密码:");
-  if(!password)return;
-  login(username,password);
-}
-
-function renderView(){
-  const view=document.querySelector(".nav-item.active")?.dataset.view||"intro";
-  const main=document.getElementById("mainContent");
-  if(!state){main.innerHTML='<div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>加载中...</p></div>';return}
-  switch(view){case"intro":renderIntro(main);break;case"posts":renderPosts(main);break;case"market":renderMarket(main);break;case"discuss":renderDiscuss(main);break}
-}
-
-function renderIntro(main){
-  let html='<div class="card"><div class="section-title"><i class="fas fa-info-circle"></i>社区介绍</div><div id="introContent" style="font-size:1rem">'+state.introContent+"</div>";
-  if(currentUser?.role==="admin"){
-    html+='<div class="admin-panel"><h4><i class="fas fa-edit"></i> 编辑介绍 (支持HTML)</h4><textarea class="textarea" id="editIntro" style="color:var(--text-primary);min-height:120px">'+state.introContent.replace(/</g,"&lt;").replace(/>/g,"&gt;")+'</textarea><button class="btn btn-primary" style="margin-top:10px" onclick="updateIntro()"><i class="fas fa-save"></i> 保存介绍</button></div><div class="admin-panel"><h4><i class="fas fa-user-plus"></i> 添加用户账号</h4><div class="flex-row"><input class="input" id="newUsername" placeholder="用户名"><input class="input" id="newPassword" type="password" placeholder="密码"><input class="input" id="newNickname" placeholder="昵称"><button class="btn btn-primary" onclick="addUser()"><i class="fas fa-plus"></i> 添加</button></div></div>';
+// ====================== 恢复出厂设置 ======================
+void checkFactoryReset() {
+  pinMode(0, INPUT_PULLUP);
+  unsigned long pressStart = 0;
+  bool pressing = false;
+  
+  for (int i = 0; i < 100; i++) {
+    if (digitalRead(0) == LOW) {
+      if (!pressing) {
+        pressing = true;
+        pressStart = millis();
+      } else if (millis() - pressStart > 5000) {
+        Serial.println("[FACTORY] Factory reset...");
+        clearAllWiFi();
+        prefs.clear();
+        delay(1000);
+        ESP.restart();
+      }
+    } else {
+      pressing = false;
+    }
+    delay(50);
   }
-  html+="</div>";main.innerHTML=html;
 }
-async function updateIntro(){const c=document.getElementById("editIntro").value;const r=await apiCall("updateIntro",{content:c});if(r){state=r.state;renderApp();showToast("介绍已更新")}}
-async function addUser(){const u=document.getElementById("newUsername").value.trim();const p=document.getElementById("newPassword").value.trim();const n=document.getElementById("newNickname").value.trim();if(!u||!p)return showToast("用户名和密码必填","error");const r=await apiCall("addUser",{username:u,password:p,nickname:n});if(r){state=r.state;renderApp();showToast("用户 "+u+" 已添加")}}
 
-function renderPosts(main){
-  let html='<div class="card"><div class="section-title"><i class="fas fa-clipboard-list"></i>技术讨论帖 <span style="font-size:0.8rem;color:var(--text-muted)">'+state.posts.length+' 篇</span></div>';
-  if(currentUser){html+='<div class="flex-row"><input class="input" id="postTitle" placeholder="帖子标题" style="flex:2"><input class="input" id="postContent" placeholder="内容" style="flex:3"><button class="btn btn-primary" onclick="addPost()"><i class="fas fa-plus"></i>发布</button></div>'}
-  else{html+='<p style="margin-bottom:16px;color:var(--text-muted)"><i class="fas fa-lock"></i> 请登录后发布帖子</p>'}
-  if(state.posts.length===0){html+='<div class="empty-state"><i class="fas fa-inbox"></i><p>暂无帖子，来发第一篇吧</p></div>'}
-  else{state.posts.forEach(p=>{html+='<div class="list-item"><div class="list-item-content"><div class="list-item-title">'+escapeHtml(p.title)+'</div><div style="color:var(--text-secondary)">'+escapeHtml(p.content)+'</div><div class="list-item-meta"><span class="list-item-author"><i class="fas fa-user"></i> '+escapeHtml(p.authorNickname||p.author)+'</span> · <i class="far fa-calendar"></i> '+escapeHtml(p.date)+'</div></div>'+(currentUser?.role==="admin"||currentUser?.username===p.author?'<button class="btn btn-danger btn-sm" onclick="deletePost('+p.id+')"><i class="fas fa-trash"></i></button>':"")+"</div>"})}
-  html+="</div>";main.innerHTML=html;
-}
-async function addPost(){const t=document.getElementById("postTitle").value.trim();const c=document.getElementById("postContent").value.trim();if(!t||!c)return showToast("请填写标题和内容","error");const r=await apiCall("addPost",{title:t,content:c});if(r){state=r.state;renderApp();showToast("帖子发布成功")}}
-async function deletePost(id){if(!confirm("确定删除此帖子？"))return;const r=await apiCall("deletePost",{id});if(r){state=r.state;renderApp();showToast("帖子已删除")}}
-
-function renderMarket(main){
-  let html='<div class="card"><div class="section-title"><i class="fas fa-store"></i>元件市集 <span style="font-size:0.8rem;color:var(--text-muted)">'+state.marketItems.length+' 件</span></div>';
-  if(currentUser){html+='<div class="flex-row"><input class="input" id="itemName" placeholder="物品名称" style="flex:2"><input class="input" id="itemPrice" placeholder="价格" style="flex:1"><input class="input" id="itemDesc" placeholder="描述" style="flex:2"><button class="btn btn-primary" onclick="addMarketItem()"><i class="fas fa-tag"></i>发布</button></div>'}
-  else{html+='<p style="margin-bottom:16px;color:var(--text-muted)"><i class="fas fa-lock"></i> 请登录后发布交易信息</p>'}
-  if(state.marketItems.length===0){html+='<div class="empty-state"><i class="fas fa-box-open"></i><p>市集空空，来发布第一个物品吧</p></div>'}
-  else{state.marketItems.forEach(m=>{html+='<div class="list-item"><div class="list-item-content"><div class="list-item-title">'+escapeHtml(m.name)+' <span style="color:#f472b6;font-weight:700">'+escapeHtml(m.price)+'</span></div><div style="color:var(--text-secondary)">'+escapeHtml(m.desc||"暂无描述")+'</div><div class="list-item-meta">卖家: <span class="list-item-author">'+escapeHtml(m.sellerNickname||m.seller)+'</span></div></div>'+(currentUser?.role==="admin"||currentUser?.username===m.seller?'<button class="btn btn-danger btn-sm" onclick="deleteMarketItem('+m.id+')"><i class="fas fa-trash"></i></button>':"")+"</div>"})}
-  html+="</div>";main.innerHTML=html;
-}
-async function addMarketItem(){const n=document.getElementById("itemName").value.trim();const p=document.getElementById("itemPrice").value.trim();const d=document.getElementById("itemDesc").value.trim();if(!n||!p)return showToast("名称和价格必填","error");const r=await apiCall("addMarketItem",{name:n,price:p,desc:d});if(r){state=r.state;renderApp();showToast("物品发布成功")}}
-async function deleteMarketItem(id){if(!confirm("确定下架此物品？"))return;const r=await apiCall("deleteMarketItem",{id});if(r){state=r.state;renderApp();showToast("物品已下架")}}
-
-function renderDiscuss(main){
-  const hasAccess=currentUser&&(state.discussAccessUsers.includes(currentUser.username)||currentUser.role==="admin");
-  let html='<div class="card"><div class="section-title"><i class="fas fa-comment-dots"></i>设计讨论室 <span style="font-size:0.7rem;color:var(--text-muted);background:rgba(96,165,250,0.1);padding:3px 10px;border-radius:20px"><i class="fas fa-lock"></i> 受限</span></div>';
-  if(!hasAccess){html+='<div class="empty-state"><i class="fas fa-lock"></i><p>此板块需要管理员授予访问权限</p><p style="font-size:0.9rem">请联系管理员添加权限</p></div>'}
-  else{
-    html+='<div class="chat-box" id="chatBox">';
-    state.discussMessages.forEach(m=>{html+='<div class="msg-bubble"><span class="msg-user">'+escapeHtml(m.user)+'</span><span class="msg-time">'+escapeHtml(m.time)+'</span><div class="msg-text">'+escapeHtml(m.text)+'</div></div>'});
-    html+='</div><div class="flex-row"><input class="input" id="msgInput" placeholder="输入消息..." onkeypress="if(event.key===\'Enter\')sendMessage()"><button class="btn btn-primary" onclick="sendMessage()"><i class="fas fa-paper-plane"></i> 发送</button></div>';
+// ====================== 初始化远控模式 ======================
+void initRemoteMode() {
+  // 初始化有线 HID
+  usb_hid.begin();
+  for (int i = 0; i < 50; i++) {
+    if (TinyUSBDevice.mounted()) {
+      usbHidReady = true;
+      Serial.println("[REMOTE] USB HID ready (wired)");
+      break;
+    }
+    delay(100);
   }
-  if(currentUser?.role==="admin"){
-    html+='<div class="admin-panel"><h4><i class="fas fa-cog"></i> 管理设置</h4><div class="flex-row"><input class="input" id="grantUser" placeholder="授权用户名"><button class="btn btn-primary btn-sm" onclick="grantAccess()"><i class="fas fa-check"></i> 授予权限</button><button class="btn btn-danger btn-sm" onclick="revokeAccess()"><i class="fas fa-times"></i> 撤销权限</button></div><div class="flex-row" style="margin-top:8px"><label style="color:var(--text-secondary);font-size:0.9rem">消息保留(小时):</label><input class="input" id="retentionHours" type="number" value="'+state.messageRetentionHours+'" style="width:80px"><button class="btn btn-primary btn-sm" onclick="updateRetention()"><i class="fas fa-sync"></i> 更新</button><button class="btn btn-danger btn-sm" onclick="clearMessages()"><i class="fas fa-trash"></i> 清空聊天</button></div></div>';
+  if (!usbHidReady) {
+    Serial.println("[REMOTE] USB not connected, will use BLE");
   }
-  html+="</div>";main.innerHTML=html;
-  if(hasAccess){setTimeout(()=>{const box=document.getElementById("chatBox");if(box)box.scrollTop=box.scrollHeight},100)}
+  
+  // 初始化蓝牙
+  bleKeyboard.begin();
+  bleReady = true;
+  Serial.println("[REMOTE] BLE keyboard ready, name: ESP32 Remote");
+  
+  remoteReady = usbHidReady || bleReady;
 }
-async function sendMessage(){const input=document.getElementById("msgInput");const text=input.value.trim();if(!text)return;const r=await apiCall("sendMessage",{text});if(r){state=r.state;renderApp();setTimeout(()=>{const box=document.getElementById("chatBox");if(box)box.scrollTop=box.scrollHeight},100)}}
-async function grantAccess(){const u=document.getElementById("grantUser").value.trim();if(!u)return showToast("请输入用户名","error");const r=await apiCall("grantAccess",{username:u});if(r){state=r.state;renderApp();showToast(u+" 已获得讨论权限")}}
-async function revokeAccess(){const u=document.getElementById("grantUser").value.trim();if(!u)return showToast("请输入用户名","error");const r=await apiCall("revokeAccess",{username:u});if(r){state=r.state;renderApp();showToast("已撤销 "+u+" 的权限")}}
-async function updateRetention(){const h=document.getElementById("retentionHours").value;const r=await apiCall("updateRetention",{hours:parseInt(h)});if(r){state=r.state;renderApp();showToast("消息保留时间已更新")}}
-async function clearMessages(){if(!confirm("确定清空所有讨论消息？"))return;const r=await apiCall("clearMessages");if(r){state=r.state;renderApp();showToast("聊天记录已清空")}}
 
-setupNav();
-loadState();
-setInterval(async()=>{
-  if(isRefreshing)return;
-  if(document.querySelector(".nav-item.active")?.dataset.view==="discuss"){
-    isRefreshing=true;
-    try{const res=await fetch(API);const ns=await res.json();if(ns&&JSON.stringify(ns.discussMessages)!==JSON.stringify(state.discussMessages)){state=ns;renderView()}}catch(e){}finally{isRefreshing=false}
+// ====================== 主程序 ======================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\n");
+  Serial.println("╔══════════════════════════════════════════════════════════════╗");
+  Serial.println("║     ESP32-S3 Dual Mode USB Bridge v5.0 - Production        ║");
+  Serial.println("║     Print Mode + Remote Control Mode                        ║");
+  Serial.println("╚══════════════════════════════════════════════════════════════╝");
+  Serial.println();
+  
+  // 初始化存储
+  prefs.begin("usb_bridge", false);
+  loadWiFiConfigs();
+  
+  // 读取上次工作模式
+  int savedMode = prefs.getInt("work_mode", 1);
+  currentWorkMode = (savedMode == 0) ? MODE_PRINTER : MODE_REMOTE;
+  Serial.printf("[INIT] Work mode: %s\n", currentWorkMode == MODE_PRINTER ? "Printer" : "Remote");
+  
+  // 检查恢复出厂
+  checkFactoryReset();
+  
+  // 初始化远控模式（始终初始化，因为模式可切换）
+  initRemoteMode();
+  
+  // 初始化 USB Host（打印模式需要）
+  initUsbHost();
+  
+  // 初始化网络
+  connectToBestWiFi();
+  
+  // 启动服务器
+  setupWebServer();
+  webSocket.begin();
+  webSocket.onEvent(onWebSocketEvent);
+  printServer.begin();
+  
+  Serial.printf("[INIT] Print port: %d, Web port: %d, WS port: %d\n", PRINT_PORT, WEB_PORT, WS_PORT);
+  Serial.println("[INIT] System ready!");
+}
+
+void loop() {
+  // 网络处理
+  if (currentNetMode == MODE_AP) {
+    dnsServer.processNextRequest();
   }
-},10000);
-</script>
-</body>
-</html>`;
+  server.handleClient();
+  webSocket.loop();
+  
+  // 打印模式：处理打印机数据
+  if (currentWorkMode == MODE_PRINTER && printerReady) {
+    WiFiClient client = printServer.available();
+    if (client && client.connected()) {
+      Serial.println("[PRINT] Receiving print job...");
+      
+      while (client.connected()) {
+        int len = client.available();
+        if (len > 0) {
+          len = min(len, USB_RECV_BUF_SIZE);
+          int bytesRead = client.read(recvBuf, len);
+          if (bytesRead > 0) {
+            if (!sendToPrinter(recvBuf, bytesRead)) {
+              Serial.println("[PRINT] Failed to send data");
+              break;
+            }
+          }
+        }
+        delay(1);
+      }
+      
+      client.stop();
+      Serial.println("[PRINT] Job completed");
+    }
+  }
+  
+  delay(10);
 }
