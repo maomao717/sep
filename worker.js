@@ -462,19 +462,19 @@ function getDefaultState() {
         id: 1,
         author: 'admin',
         authorNickname: '管理员',
-        title: '欢迎来到SEP工作室',                    // ← 改这里
-        content: '16-17电子工业园 · PCB设计交流社区，欢迎各位工程师！',  // ← 改这里
+        title: '欢迎来到SEP工作室',                    
+        content: '16-17电子工业园 · PCB设计交流社区，欢迎各位工程师！',  
         date: '2024-01-15',
         timestamp: Date.now()
       }
     ],
     marketItems: [],
     discussMessages: [
-      { user: '管理员', text: '欢迎来到SEP工作室讨论室', time: '09:00', timestamp: Date.now() }  // ← 改这里
+      { user: '管理员', text: '欢迎来到SEP工作室讨论室', time: '09:00', timestamp: Date.now() }  
     ],
     discussAccessUsers: ['admin', 'engineer_lee'],
     messageRetentionHours: 24,
-    introContent: '<h2 style="background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:1.8rem;margin-bottom:16px">⚡ SEP工作室</h2><p style="font-size:1.1rem;line-height:1.8;color:#94a3b8">16-17电子工业园 · PCB设计交流社区</p><p style="font-size:1.1rem;line-height:1.8;color:#94a3b8">我们致力于<strong style="color:#60a5fa">高频/高速PCB设计</strong>、<strong style="color:#a78bfa">信号完整性分析</strong>、<strong style="color:#f472b6">EMC设计</strong>等专业领域。</p><p style="margin-top:12px;padding:12px 20px;background:rgba(96,165,250,0.1);border-radius:12px;border-left:3px solid #60a5fa;color:#93c5fd"><strong>🔐 管理员发布账号，不支持自主注册。</strong></p>'  // ← 改这里
+    introContent: '<h2 style="background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:1.8rem;margin-bottom:16px">⚡ SEP工作室</h2><p style="font-size:1.1rem;line-height:1.8;color:#94a3b8">16-17电子工业园 · PCB设计交流社区</p><p style="font-size:1.1rem;line-height:1.8;color:#94a3b8">我们致力于<strong style="color:#60a5fa">高频/高速PCB设计</strong>、<strong style="color:#a78bfa">信号完整性分析</strong>、<strong style="color:#f472b6">EMC设计</strong>等专业领域。</p><p style="margin-top:12px;padding:12px 20px;background:rgba(96,165,250,0.1);border-radius:12px;border-left:3px solid #60a5fa;color:#93c5fd"><strong>🔐 管理员发布账号，不支持自主注册。</strong></p>'  
   };
 }
 // ============ 前端 HTML（全新 UI） ============
