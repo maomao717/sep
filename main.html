@@ -1,0 +1,1122 @@
+// ============================================
+// PCB设计工会 - 高级UI版
+// Workers KV绑定名: sep_kv
+// ============================================
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    
+    if (url.pathname === '/api/state') {
+      return handleStateAPI(request, env);
+    }
+    
+    return new Response(getHTML(), {
+      headers: { 
+        'Content-Type': 'text/html;charset=UTF-8',
+        'Cache-Control': 'no-cache'
+      }
+    });
+  }
+};
+
+// ============ 加密工具 ============
+
+async function getHMACKey(env) {
+  let keyBase64 = await env.sep_kv.get('hmac_secret');
+  if (!keyBase64) {
+    const key = await crypto.subtle.generateKey(
+      { name: 'HMAC', hash: 'SHA-256' },
+      true,
+      ['sign', 'verify']
+    );
+    const exported = await crypto.subtle.exportKey('raw', key);
+    keyBase64 = btoa(String.fromCharCode(...new Uint8Array(exported)));
+    await env.sep_kv.put('hmac_secret', keyBase64);
+  }
+  
+  const keyBytes = Uint8Array.from(atob(keyBase64), c => c.charCodeAt(0));
+  return await crypto.subtle.importKey(
+    'raw', keyBytes,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false, ['sign', 'verify']
+  );
+}
+
+async function generateToken(username, role, env) {
+  const key = await getHMACKey(env);
+  const payload = JSON.stringify({
+    username, role,
+    exp: Date.now() + 24 * 60 * 60 * 1000,
+    iat: Date.now()
+  });
+  
+  const encoder = new TextEncoder();
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
+  const sigBase64 = btoa(String.fromCharCode(...new Uint8Array(signature)));
+  
+  return btoa(payload) + '.' + sigBase64;
+}
+
+async function verifyToken(token, env) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    
+    const payload = JSON.parse(atob(parts[0]));
+    const signature = parts[1];
+    
+    if (payload.exp < Date.now()) return null;
+    
+    const key = await getHMACKey(env);
+    const encoder = new TextEncoder();
+    const sigBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+    const isValid = await crypto.subtle.verify(
+      'HMAC', key, sigBytes,
+      encoder.encode(JSON.stringify(payload))
+    );
+    
+    return isValid ? payload : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ============ 日志工具 ============
+
+async function addLog(env, action, username, detail) {
+  try {
+    const now = new Date();
+    const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    const logEntry = {
+      id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
+      timestamp: now.getTime(),
+      time: beijingTime.toISOString().replace('T', ' ').substring(0, 19),
+      action, username: username || '未登录', detail: detail || ''
+    };
+    
+    let logs = await env.sep_kv.get('operation_logs', { type: 'json' }) || [];
+    logs.unshift(logEntry);
+    if (logs.length > 500) logs = logs.slice(0, 500);
+    
+    await env.sep_kv.put('operation_logs', JSON.stringify(logs));
+  } catch (e) {
+    console.error('日志记录失败:', e);
+  }
+}
+
+// ============ 工具函数 ============
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+function getBeijingTimeShort() {
+  const now = new Date();
+  const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  return beijingTime.toISOString().substring(11, 16);
+}
+
+function getBeijingDate() {
+  const now = new Date();
+  const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  return beijingTime.toISOString().substring(0, 10);
+}
+
+// ============ API 处理 ============
+
+async function handleStateAPI(request, env) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+  };
+
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { headers });
+  }
+
+  if (request.method === 'GET') {
+    try {
+      let state = await env.sep_kv.get('app_state', { type: 'json' });
+      if (!state) {
+        state = getDefaultState();
+        await env.sep_kv.put('app_state', JSON.stringify(state));
+      }
+      const safeState = { ...state };
+      safeState.users = state.users.map(u => ({ username: u.username, nickname: u.nickname, role: u.role }));
+      return new Response(JSON.stringify(safeState), { headers });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: '服务器内部错误' }), { status: 500, headers });
+    }
+  }
+
+  if (request.method === 'POST') {
+    try {
+      const data = await request.json();
+      const { token, action, payload } = data;
+
+      let state = await env.sep_kv.get('app_state', { type: 'json' });
+      if (!state) state = getDefaultState();
+
+      let currentUser = null;
+
+      if (action !== 'login' && action !== 'getLogs') {
+        if (!token) {
+          return new Response(JSON.stringify({ error: '请先登录' }), { status: 401, headers });
+        }
+        currentUser = await verifyToken(token, env);
+        if (!currentUser) {
+          return new Response(JSON.stringify({ error: '登录已过期，请重新登录' }), { status: 401, headers });
+        }
+        const userExists = state.users.find(u => u.username === currentUser.username);
+        if (!userExists) {
+          return new Response(JSON.stringify({ error: '账号已被删除' }), { status: 403, headers });
+        }
+        currentUser.role = userExists.role;
+        currentUser.nickname = userExists.nickname;
+      }
+
+      let newToken = token;
+
+      switch (action) {
+        case 'login': {
+          const { username, password } = payload;
+          if (!username || !password) {
+            return new Response(JSON.stringify({ error: '用户名和密码不能为空' }), { status: 400, headers });
+          }
+          const loginUser = state.users.find(u => u.username === username && u.password === password);
+          if (!loginUser) {
+            return new Response(JSON.stringify({ error: '账号或密码错误' }), { status: 401, headers });
+          }
+          newToken = await generateToken(loginUser.username, loginUser.role, env);
+          await addLog(env, '登录', username, '用户登录成功');
+          return new Response(JSON.stringify({ 
+            success: true, token: newToken,
+            user: { username: loginUser.username, role: loginUser.role, nickname: loginUser.nickname } 
+          }), { headers });
+        }
+
+        case 'getLogs': {
+          if (token) {
+            currentUser = await verifyToken(token, env);
+            if (!currentUser || currentUser.role !== 'admin') {
+              return new Response(JSON.stringify({ error: '仅管理员可查看日志' }), { status: 403, headers });
+            }
+            const logs = await env.sep_kv.get('operation_logs', { type: 'json' }) || [];
+            return new Response(JSON.stringify({ success: true, logs }), { headers });
+          }
+          return new Response(JSON.stringify({ error: '未授权' }), { status: 403, headers });
+        }
+
+        case 'clearLogs': {
+          if (currentUser.role !== 'admin') {
+            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
+          }
+          await env.sep_kv.put('operation_logs', JSON.stringify([]));
+          await addLog(env, '清空日志', currentUser.username, '管理员清空了操作日志');
+          break;
+        }
+
+        case 'addPost': {
+          const title = escapeHtml(payload.title || '');
+          const content = escapeHtml(payload.content || '');
+          if (!title || !content) {
+            return new Response(JSON.stringify({ error: '标题和内容不能为空' }), { status: 400, headers });
+          }
+          state.posts.unshift({
+            id: Date.now(),
+            author: currentUser.username,
+            authorNickname: escapeHtml(currentUser.nickname),
+            title, content,
+            date: getBeijingDate(),
+            timestamp: Date.now()
+          });
+          await addLog(env, '发布帖子', currentUser.username, '标题: ' + title);
+          break;
+        }
+
+        case 'deletePost': {
+          const postId = payload.id;
+          const post = state.posts.find(p => p.id === postId);
+          if (!post) {
+            return new Response(JSON.stringify({ error: '帖子不存在' }), { status: 404, headers });
+          }
+          if (currentUser.role !== 'admin' && post.author !== currentUser.username) {
+            return new Response(JSON.stringify({ error: '无权限删除此帖子' }), { status: 403, headers });
+          }
+          state.posts = state.posts.filter(p => p.id !== postId);
+          await addLog(env, '删除帖子', currentUser.username, '帖子ID: ' + postId);
+          break;
+        }
+
+        case 'addMarketItem': {
+          const name = escapeHtml(payload.name || '');
+          const price = escapeHtml(payload.price || '');
+          const desc = escapeHtml(payload.desc || '');
+          if (!name || !price) {
+            return new Response(JSON.stringify({ error: '名称和价格必填' }), { status: 400, headers });
+          }
+          state.marketItems.unshift({
+            id: Date.now(),
+            seller: currentUser.username,
+            sellerNickname: escapeHtml(currentUser.nickname),
+            name, price, desc,
+            timestamp: Date.now()
+          });
+          await addLog(env, '发布市集物品', currentUser.username, '物品: ' + name);
+          break;
+        }
+
+        case 'deleteMarketItem': {
+          const itemId = payload.id;
+          const item = state.marketItems.find(m => m.id === itemId);
+          if (!item) {
+            return new Response(JSON.stringify({ error: '物品不存在' }), { status: 404, headers });
+          }
+          if (currentUser.role !== 'admin' && item.seller !== currentUser.username) {
+            return new Response(JSON.stringify({ error: '无权限删除此物品' }), { status: 403, headers });
+          }
+          state.marketItems = state.marketItems.filter(m => m.id !== itemId);
+          await addLog(env, '下架市集物品', currentUser.username, '物品ID: ' + itemId);
+          break;
+        }
+
+        case 'sendMessage': {
+          if (!state.discussAccessUsers.includes(currentUser.username) && currentUser.role !== 'admin') {
+            return new Response(JSON.stringify({ error: '无讨论权限，请联系管理员' }), { status: 403, headers });
+          }
+          const text = escapeHtml(payload.text || '');
+          if (!text) {
+            return new Response(JSON.stringify({ error: '消息不能为空' }), { status: 400, headers });
+          }
+          state.discussMessages.push({
+            user: escapeHtml(currentUser.nickname || currentUser.username),
+            text, time: getBeijingTimeShort(), timestamp: Date.now()
+          });
+          const now = Date.now();
+          const retentionMs = (state.messageRetentionHours || 24) * 3600000;
+          state.discussMessages = state.discussMessages.filter(m => (now - m.timestamp) < retentionMs);
+          if (state.discussMessages.length > 500) state.discussMessages = state.discussMessages.slice(-500);
+          break;
+        }
+
+        case 'grantAccess': {
+          if (currentUser.role !== 'admin') {
+            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
+          }
+          const grantUsername = payload.username;
+          if (!grantUsername) {
+            return new Response(JSON.stringify({ error: '请输入用户名' }), { status: 400, headers });
+          }
+          const grantUserExists = state.users.find(u => u.username === grantUsername);
+          if (!grantUserExists) {
+            return new Response(JSON.stringify({ error: '用户不存在' }), { status: 400, headers });
+          }
+          if (state.discussAccessUsers.includes(grantUsername)) {
+            return new Response(JSON.stringify({ error: '该用户已有讨论权限' }), { status: 400, headers });
+          }
+          state.discussAccessUsers.push(grantUsername);
+          await addLog(env, '授予讨论权限', currentUser.username, '授予: ' + grantUsername);
+          break;
+        }
+
+        case 'revokeAccess': {
+          if (currentUser.role !== 'admin') {
+            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
+          }
+          state.discussAccessUsers = state.discussAccessUsers.filter(u => u !== payload.username);
+          await addLog(env, '撤销讨论权限', currentUser.username, '撤销: ' + payload.username);
+          break;
+        }
+
+        case 'updateRetention': {
+          if (currentUser.role !== 'admin') {
+            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
+          }
+          const hours = parseInt(payload.hours);
+          if (isNaN(hours) || hours < 1 || hours > 720) {
+            return new Response(JSON.stringify({ error: '保留时间需在 1-720 小时之间' }), { status: 400, headers });
+          }
+          state.messageRetentionHours = hours;
+          await addLog(env, '更新消息保留时间', currentUser.username, hours + '小时');
+          break;
+        }
+
+        case 'clearMessages': {
+          if (currentUser.role !== 'admin') {
+            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
+          }
+          state.discussMessages = [];
+          await addLog(env, '清空讨论消息', currentUser.username, '');
+          break;
+        }
+
+        case 'updateIntro': {
+          if (currentUser.role !== 'admin') {
+            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
+          }
+          state.introContent = payload.content || '';
+          await addLog(env, '更新介绍', currentUser.username, '');
+          break;
+        }
+
+        case 'addUser': {
+          if (currentUser.role !== 'admin') {
+            return new Response(JSON.stringify({ error: '仅管理员可操作' }), { status: 403, headers });
+          }
+          const newUsername = escapeHtml(payload.username || '').trim();
+          const newPassword = payload.password || '';
+          const newNickname = escapeHtml(payload.nickname || '').trim();
+          if (!newUsername || !newPassword) {
+            return new Response(JSON.stringify({ error: '用户名和密码必填' }), { status: 400, headers });
+          }
+          if (state.users.find(u => u.username === newUsername)) {
+            return new Response(JSON.stringify({ error: '用户已存在' }), { status: 400, headers });
+          }
+          state.users.push({ username: newUsername, password: newPassword, role: 'user', nickname: newNickname || newUsername });
+          await addLog(env, '添加用户', currentUser.username, '新用户: ' + newUsername);
+          break;
+        }
+
+        case 'deleteUser': {
+          if (currentUser.role !== 'admin') {
+            return new Response(JSON.stringify({ error: '仅管理员可删除用户' }), { status: 403, headers });
+          }
+          if (payload.username === 'admin') {
+            return new Response(JSON.stringify({ error: '不能删除管理员账号' }), { status: 400, headers });
+          }
+          const userIndex = state.users.findIndex(u => u.username === payload.username);
+          if (userIndex === -1) {
+            return new Response(JSON.stringify({ error: '用户不存在' }), { status: 404, headers });
+          }
+          state.users.splice(userIndex, 1);
+          state.discussAccessUsers = state.discussAccessUsers.filter(u => u !== payload.username);
+          state.posts = state.posts.filter(p => p.author !== payload.username);
+          state.marketItems = state.marketItems.filter(m => m.seller !== payload.username);
+          state.discussMessages = state.discussMessages.filter(m => {
+            const msgUser = state.users.find(u => u.nickname === m.user);
+            return msgUser && msgUser.username !== payload.username;
+          });
+          await addLog(env, '删除用户', currentUser.username, '删除: ' + payload.username);
+          break;
+        }
+
+        case 'updateProfile': {
+          const newNickname = escapeHtml(payload.newNickname || '').trim();
+          const newPassword = payload.newPassword || '';
+          if (!newNickname && !newPassword) {
+            return new Response(JSON.stringify({ error: '没有要更新的内容' }), { status: 400, headers });
+          }
+          const userToUpdate = state.users.find(u => u.username === currentUser.username);
+          if (!userToUpdate) {
+            return new Response(JSON.stringify({ error: '用户不存在' }), { status: 404, headers });
+          }
+          if (newNickname) {
+            userToUpdate.nickname = newNickname;
+            currentUser.nickname = newNickname;
+            state.discussMessages.forEach(m => {
+              if (state.users.find(u => u.nickname === m.user && u.username === currentUser.username)) {
+                m.user = newNickname;
+              }
+            });
+          }
+          if (newPassword) userToUpdate.password = newPassword;
+          newToken = await generateToken(currentUser.username, currentUser.role, env);
+          await addLog(env, '更新个人信息', currentUser.username, '');
+          break;
+        }
+
+        default:
+          return new Response(JSON.stringify({ error: '未知操作' }), { status: 400, headers });
+      }
+
+      await env.sep_kv.put('app_state', JSON.stringify(state));
+      
+      const safeState = { ...state };
+      safeState.users = state.users.map(u => ({ username: u.username, nickname: u.nickname, role: u.role }));
+      
+      return new Response(JSON.stringify({ success: true, token: newToken, state: safeState }), { headers });
+
+    } catch (error) {
+      console.error('POST error:', error);
+      return new Response(JSON.stringify({ error: '服务器内部错误' }), { status: 500, headers });
+    }
+  }
+
+  return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405, headers });
+}
+
+// ============ 默认状态 ============
+
+function getDefaultState() {
+  return {
+    users: [
+      { username: 'admin', password: 'pcb2024', role: 'admin', nickname: '工会理事' },
+      { username: 'engineer_lee', password: 'lee123', role: 'user', nickname: 'Lee' },
+      { username: 'soldering_queen', password: 'queen123', role: 'user', nickname: '焊将' }
+    ],
+    posts: [
+      {
+        id: 1, author: 'admin', authorNickname: '工会理事',
+        title: '欢迎来到PCB设计工会',
+        content: '这是一个专注于PCB设计的社区，欢迎各位工程师交流讨论！',
+        date: '2024-01-15', timestamp: Date.now()
+      }
+    ],
+    marketItems: [],
+    discussMessages: [
+      { user: '工会理事', text: '欢迎进入PCB设计讨论室', time: '09:00', timestamp: Date.now() }
+    ],
+    discussAccessUsers: ['admin', 'engineer_lee'],
+    messageRetentionHours: 24,
+    introContent: '<h2 style="background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:1.8rem;margin-bottom:16px">⚡ PCB设计工会</h2><p style="font-size:1.1rem;line-height:1.8;color:#94a3b8">我们致力于<strong style="color:#60a5fa">高频/高速PCB设计</strong>、<strong style="color:#a78bfa">信号完整性分析</strong>、<strong style="color:#f472b6">EMC设计</strong>等专业领域。</p><p style="margin-top:12px;padding:12px 20px;background:rgba(96,165,250,0.1);border-radius:12px;border-left:3px solid #60a5fa;color:#93c5fd"><strong>🔐 管理员发布账号，不支持自主注册。</strong></p>'
+  };
+}
+
+// ============ 前端 HTML（全新 UI） ============
+
+function getHTML() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PCB设计工会 · 极域</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    
+    :root{
+      --bg-primary:#0f172a;
+      --bg-secondary:#1e293b;
+      --bg-card:rgba(30,41,59,0.8);
+      --bg-input:rgba(15,23,42,0.6);
+      --text-primary:#f1f5f9;
+      --text-secondary:#94a3b8;
+      --text-muted:#64748b;
+      --accent-blue:#60a5fa;
+      --accent-purple:#a78bfa;
+      --accent-pink:#f472b6;
+      --accent-cyan:#22d3ee;
+      --gradient-1:linear-gradient(135deg,#60a5fa,#a78bfa);
+      --gradient-2:linear-gradient(135deg,#a78bfa,#f472b6);
+      --gradient-3:linear-gradient(135deg,#60a5fa,#22d3ee);
+      --border:rgba(148,163,184,0.1);
+      --shadow:0 8px 32px rgba(0,0,0,0.3);
+      --shadow-lg:0 20px 60px rgba(0,0,0,0.5);
+      --radius:16px;
+      --radius-sm:10px;
+      --radius-lg:24px;
+      --transition:all 0.3s cubic-bezier(0.4,0,0.2,1);
+    }
+
+    body{
+      font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
+      background:var(--bg-primary);
+      background-image:
+        radial-gradient(ellipse at 20% 20%,rgba(96,165,250,0.08) 0%,transparent 50%),
+        radial-gradient(ellipse at 80% 80%,rgba(167,139,250,0.08) 0%,transparent 50%),
+        radial-gradient(ellipse at 50% 50%,rgba(244,114,182,0.05) 0%,transparent 50%);
+      color:var(--text-primary);
+      min-height:100vh;
+      display:flex;
+      justify-content:center;
+      align-items:center;
+      padding:16px;
+      line-height:1.6;
+    }
+
+    .app-container{
+      width:100%;
+      max-width:1400px;
+      height:92vh;
+      max-height:950px;
+      background:var(--bg-secondary);
+      backdrop-filter:blur(40px);
+      -webkit-backdrop-filter:blur(40px);
+      border-radius:var(--radius-lg);
+      display:flex;
+      flex-direction:column;
+      overflow:hidden;
+      border:1px solid var(--border);
+      box-shadow:var(--shadow-lg);
+    }
+
+    /* 导航栏 */
+    .navbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      padding:16px 28px;
+      background:rgba(15,23,42,0.6);
+      backdrop-filter:blur(20px);
+      border-bottom:1px solid var(--border);
+      flex-shrink:0;
+      gap:16px;
+    }
+
+    .logo-area{
+      display:flex;
+      align-items:center;
+      gap:12px;
+    }
+
+    .logo-icon{
+      width:44px;
+      height:44px;
+      background:var(--gradient-1);
+      border-radius:14px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size:22px;
+      color:white;
+      box-shadow:0 4px 15px rgba(96,165,250,0.3);
+    }
+
+    .logo-text{
+      font-weight:800;
+      font-size:1.4rem;
+      background:var(--gradient-1);
+      -webkit-background-clip:text;
+      -webkit-text-fill-color:transparent;
+      background-clip:text;
+      letter-spacing:-0.5px;
+    }
+
+    .nav-links{
+      display:flex;
+      gap:4px;
+      background:rgba(15,23,42,0.5);
+      padding:4px;
+      border-radius:40px;
+      border:1px solid var(--border);
+    }
+
+    .nav-item{
+      padding:10px 22px;
+      border-radius:30px;
+      font-weight:500;
+      font-size:0.9rem;
+      color:var(--text-secondary);
+      cursor:pointer;
+      border:none;
+      background:transparent;
+      display:flex;
+      align-items:center;
+      gap:8px;
+      transition:var(--transition);
+      white-space:nowrap;
+    }
+
+    .nav-item:hover{color:var(--accent-blue);}
+    
+    .nav-item.active{
+      background:rgba(96,165,250,0.15);
+      color:var(--accent-blue);
+      font-weight:600;
+      box-shadow:0 2px 10px rgba(96,165,250,0.1);
+    }
+
+    .user-section{
+      display:flex;
+      align-items:center;
+      gap:12px;
+      flex-shrink:0;
+    }
+
+    .btn{
+      padding:10px 20px;
+      border-radius:30px;
+      font-weight:600;
+      cursor:pointer;
+      border:none;
+      display:flex;
+      align-items:center;
+      gap:8px;
+      font-size:0.9rem;
+      transition:var(--transition);
+      font-family:inherit;
+    }
+
+    .btn-primary{
+      background:var(--gradient-1);
+      color:white;
+      box-shadow:0 4px 15px rgba(96,165,250,0.3);
+    }
+    .btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(96,165,250,0.4);}
+
+    .btn-danger{
+      background:rgba(239,68,68,0.15);
+      color:#f87171;
+      border:1px solid rgba(239,68,68,0.2);
+    }
+    .btn-danger:hover{background:rgba(239,68,68,0.25);}
+
+    .btn-outline{
+      background:transparent;
+      border:1px solid var(--border);
+      color:var(--text-secondary);
+    }
+    .btn-outline:hover{border-color:var(--accent-blue);color:var(--accent-blue);}
+
+    .btn-sm{padding:6px 14px;font-size:0.8rem;}
+
+    .user-badge{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      background:rgba(96,165,250,0.1);
+      padding:8px 16px;
+      border-radius:30px;
+      border:1px solid rgba(96,165,250,0.2);
+      cursor:pointer;
+      transition:var(--transition);
+    }
+    .user-badge:hover{border-color:var(--accent-blue);background:rgba(96,165,250,0.15);}
+
+    .admin-badge{
+      background:var(--gradient-2);
+      color:white;
+      padding:3px 10px;
+      border-radius:20px;
+      font-size:0.7rem;
+      font-weight:700;
+      letter-spacing:0.5px;
+    }
+
+    .main-content{
+      flex:1;
+      padding:24px;
+      overflow-y:auto;
+    }
+
+    .main-content::-webkit-scrollbar{width:6px;}
+    .main-content::-webkit-scrollbar-track{background:transparent;}
+    .main-content::-webkit-scrollbar-thumb{background:rgba(148,163,184,0.2);border-radius:10px;}
+    .main-content::-webkit-scrollbar-thumb:hover{background:rgba(148,163,184,0.4);}
+
+    /* 卡片 */
+    .card{
+      background:var(--bg-card);
+      border-radius:var(--radius);
+      padding:28px;
+      border:1px solid var(--border);
+      backdrop-filter:blur(20px);
+      animation:fadeIn 0.4s ease;
+      margin-bottom:16px;
+    }
+
+    @keyframes fadeIn{from{opacity:0;transform:translateY(15px)}to{opacity:1;transform:translateY(0)}}
+
+    .section-title{
+      font-size:1.4rem;
+      font-weight:700;
+      margin-bottom:24px;
+      display:flex;
+      align-items:center;
+      gap:12px;
+    }
+    .section-title i{background:var(--gradient-1);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+
+    .flex-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px;}
+
+    .input,.textarea{
+      background:var(--bg-input);
+      border:1px solid var(--border);
+      border-radius:var(--radius-sm);
+      padding:12px 16px;
+      font-family:inherit;
+      font-size:0.95rem;
+      color:var(--text-primary);
+      outline:none;
+      flex:1;
+      min-width:150px;
+      transition:var(--transition);
+    }
+    .input:focus,.textarea:focus{border-color:var(--accent-blue);box-shadow:0 0 0 3px rgba(96,165,250,0.15);}
+    .input::placeholder,.textarea::placeholder{color:var(--text-muted);}
+    .textarea{resize:vertical;min-height:80px;}
+
+    /* 列表项 */
+    .list-item{
+      background:rgba(15,23,42,0.4);
+      border-radius:var(--radius-sm);
+      padding:18px;
+      margin-bottom:10px;
+      border:1px solid var(--border);
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:12px;
+      transition:var(--transition);
+    }
+    .list-item:hover{border-color:rgba(96,165,250,0.3);background:rgba(15,23,42,0.6);}
+    .list-item-content{flex:1;}
+    .list-item-title{font-weight:600;color:var(--text-primary);margin-bottom:6px;font-size:1.05rem;}
+    .list-item-meta{font-size:0.85rem;color:var(--text-muted);}
+    .list-item-author{color:var(--accent-blue);font-weight:500;}
+
+    /* 聊天 */
+    .chat-box{
+      height:350px;
+      overflow-y:auto;
+      background:rgba(15,23,42,0.5);
+      border-radius:var(--radius-sm);
+      padding:16px;
+      margin:16px 0;
+      border:1px solid var(--border);
+    }
+    .chat-box::-webkit-scrollbar{width:4px;}
+    .chat-box::-webkit-scrollbar-thumb{background:rgba(148,163,184,0.3);border-radius:10px;}
+
+    .msg-bubble{
+      background:rgba(96,165,250,0.08);
+      padding:10px 16px;
+      border-radius:14px;
+      margin-bottom:8px;
+      border:1px solid rgba(96,165,250,0.1);
+      display:inline-block;
+      max-width:85%;
+    }
+    .msg-user{font-weight:600;color:var(--accent-blue);font-size:0.9rem;}
+    .msg-time{font-size:0.7rem;color:var(--text-muted);margin-left:8px;}
+    .msg-text{color:var(--text-secondary);margin-top:4px;}
+
+    /* 管理面板 */
+    .admin-panel{
+      background:rgba(167,139,250,0.05);
+      border:1px solid rgba(167,139,250,0.15);
+      border-radius:var(--radius-sm);
+      padding:20px;
+      margin-top:20px;
+    }
+    .admin-panel h4{margin-bottom:14px;color:var(--accent-purple);font-size:0.95rem;}
+
+    .user-list-item{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      padding:12px 16px;
+      background:rgba(15,23,42,0.5);
+      border-radius:var(--radius-sm);
+      margin-bottom:8px;
+      border:1px solid var(--border);
+    }
+    .user-list-info{display:flex;align-items:center;gap:12px;}
+    .user-avatar{
+      width:38px;
+      height:38px;
+      border-radius:50%;
+      background:var(--gradient-2);
+      color:white;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-weight:700;
+      font-size:0.9rem;
+    }
+
+    /* 模态框 */
+    .modal-overlay{
+      position:fixed;
+      top:0;left:0;right:0;bottom:0;
+      background:rgba(0,0,0,0.7);
+      backdrop-filter:blur(6px);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      z-index:1000;
+      animation:fadeIn 0.2s ease;
+    }
+    .modal{
+      background:var(--bg-secondary);
+      border-radius:var(--radius-lg);
+      padding:32px;
+      width:90%;
+      max-width:480px;
+      border:1px solid var(--border);
+      box-shadow:var(--shadow-lg);
+      animation:slideUp 0.3s ease;
+    }
+    @keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+    .modal h3{margin-bottom:20px;font-size:1.3rem;}
+
+    .modal label{display:block;font-size:0.9rem;color:var(--text-secondary);margin-bottom:6px;}
+    .modal .input{margin-bottom:14px;}
+
+    .modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:24px;}
+
+    /* Toast */
+    .toast{
+      position:fixed;
+      top:20px;
+      right:20px;
+      padding:14px 24px;
+      background:var(--bg-secondary);
+      border-radius:var(--radius-sm);
+      border:1px solid var(--border);
+      box-shadow:var(--shadow);
+      z-index:1001;
+      font-weight:500;
+      animation:slideIn 0.3s ease;
+    }
+    @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+    .toast.error{border-left:3px solid #f87171;color:#f87171;}
+    .toast.success{border-left:3px solid #34d399;color:#34d399;}
+
+    .empty-state{text-align:center;padding:60px 20px;color:var(--text-muted);}
+    .empty-state i{font-size:3.5rem;margin-bottom:16px;opacity:0.3;}
+
+    /* 日志表格 */
+    .log-table{width:100%;border-collapse:collapse;font-size:0.85rem;}
+    .log-table th{text-align:left;padding:10px 12px;color:var(--accent-cyan);border-bottom:1px solid var(--border);font-weight:600;}
+    .log-table td{padding:10px 12px;border-bottom:1px solid rgba(148,163,184,0.05);color:var(--text-secondary);}
+    .log-table tr:hover td{background:rgba(96,165,250,0.03);}
+
+    .badge{
+      display:inline-block;
+      padding:3px 10px;
+      border-radius:20px;
+      font-size:0.75rem;
+      font-weight:600;
+    }
+    .badge-info{background:rgba(96,165,250,0.15);color:var(--accent-blue);}
+    .badge-danger{background:rgba(239,68,68,0.15);color:#f87171;}
+    .badge-success{background:rgba(52,211,153,0.15);color:#34d399;}
+
+    @media(max-width:768px){
+      .navbar{flex-direction:column;padding:12px;}
+      .nav-links{width:100%;justify-content:center;overflow-x:auto;}
+      .nav-item{padding:8px 14px;font-size:0.8rem;}
+      .main-content{padding:14px;}
+      .card{padding:18px;}
+      .list-item{flex-direction:column;}
+      .modal{width:95%;padding:20px;}
+    }
+  </style>
+</head>
+<body>
+<div class="app-container">
+  <div class="navbar">
+    <div class="logo-area">
+      <div class="logo-icon"><i class="fas fa-microchip"></i></div>
+      <span class="logo-text">PCB·设计工会</span>
+    </div>
+    <div class="nav-links" id="navLinks">
+      <button class="nav-item active" data-view="intro"><i class="fas fa-info-circle"></i>介绍</button>
+      <button class="nav-item" data-view="posts"><i class="fas fa-comments"></i>帖子</button>
+      <button class="nav-item" data-view="market"><i class="fas fa-store"></i>市集</button>
+      <button class="nav-item" data-view="discuss"><i class="fas fa-comment-dots"></i>讨论</button>
+    </div>
+    <div class="user-section" id="userSection"></div>
+  </div>
+  <div class="main-content" id="mainContent"><div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>正在加载极域...</p></div></div>
+</div>
+
+<script>
+const API="/api/state";
+let state=null,currentUser=null,authToken=null,isRefreshing=false;
+
+function escapeHtml(str){
+  if(!str)return"";
+  return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");
+}
+
+function showToast(msg,type="success"){
+  const old=document.querySelector(".toast");
+  if(old)old.remove();
+  const toast=document.createElement("div");
+  toast.className="toast "+type;
+  toast.innerHTML='<i class="fas '+(type==="success"?"fa-check-circle":"fa-exclamation-circle")+'"></i> '+escapeHtml(msg);
+  document.body.appendChild(toast);
+  setTimeout(()=>toast.remove(),3000);
+}
+
+async function apiCall(action,payload={}){
+  const body={token:authToken,action,payload};
+  try{
+    const res=await fetch(API,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const data=await res.json();
+    if(data.error){showToast(data.error,"error");return null}
+    if(data.token)authToken=data.token;
+    return data;
+  }catch(e){showToast("网络错误","error");return null}
+}
+
+async function loadState(){
+  try{
+    const res=await fetch(API);
+    state=await res.json();
+    renderApp();
+  }catch(e){document.getElementById("mainContent").innerHTML='<div class="card"><p style="color:#f87171">加载失败，请刷新</p></div>'}
+}
+
+async function login(username,password){
+  const result=await apiCall("login",{username,password});
+  if(result&&result.user){currentUser=result.user;authToken=result.token;renderApp();showToast("欢迎回来，"+escapeHtml(result.user.nickname))}
+}
+
+function logout(){currentUser=null;authToken=null;renderApp()}
+
+function showProfileModal(){
+  const modal=document.createElement("div");modal.className="modal-overlay";modal.id="profileModal";
+  modal.innerHTML='<div class="modal"><h3><i class="fas fa-user-edit"></i> 编辑个人信息</h3><p style="color:var(--text-muted);margin-bottom:16px">当前账号: <strong style="color:var(--accent-blue)">'+escapeHtml(currentUser.username)+'</strong></p><label>新昵称</label><input class="input" id="editNickname" value="'+escapeHtml(currentUser.nickname)+'"><label>新密码（留空不修改）</label><input class="input" id="editPassword" type="password" placeholder="输入新密码"><div class="modal-actions"><button class="btn btn-outline" onclick="closeProfileModal()">取消</button><button class="btn btn-primary" onclick="saveProfile()">保存</button></div></div>';
+  document.body.appendChild(modal);
+  modal.addEventListener("click",e=>{if(e.target===modal)closeProfileModal()});
+}
+function closeProfileModal(){const m=document.getElementById("profileModal");if(m)m.remove()}
+async function saveProfile(){
+  const nn=document.getElementById("editNickname").value.trim();
+  const np=document.getElementById("editPassword").value.trim();
+  if(!nn&&!np){showToast("没有要修改的内容","error");return}
+  const r=await apiCall("updateProfile",{newNickname:nn,newPassword:np});
+  if(r){if(nn)currentUser.nickname=nn;if(r.token)authToken=r.token;state=r.state;closeProfileModal();renderApp();showToast("个人信息已更新")}
+}
+
+function showUserManagementModal(){
+  const modal=document.createElement("div");modal.className="modal-overlay";modal.id="umModal";
+  let list="";
+  state.users.forEach(u=>{list+='<div class="user-list-item"><div class="user-list-info"><div class="user-avatar">'+escapeHtml(u.nickname.charAt(0).toUpperCase())+'</div><div><strong>'+escapeHtml(u.nickname)+'</strong><span style="color:var(--text-muted);font-size:.85rem;margin-left:4px">@'+escapeHtml(u.username)+'</span>'+(u.role==="admin"?'<span class="admin-badge" style="margin-left:8px">管理员</span>':"")+'</div></div>'+(u.username!=="admin"?'<button class="btn btn-danger btn-sm" onclick="deleteUserAccount(\''+escapeHtml(u.username)+'\')"><i class="fas fa-trash"></i> 删除</button>':'<span style="color:var(--text-muted);font-size:.8rem">不可删除</span>')+"</div>"});
+  modal.innerHTML='<div class="modal" style="max-width:550px"><h3><i class="fas fa-users-cog"></i> 用户管理</h3><p style="color:var(--text-muted);margin-bottom:16px">共 <strong style="color:var(--accent-blue)">'+state.users.length+'</strong> 个用户</p><div style="max-height:400px;overflow-y:auto">'+list+'</div><div class="modal-actions"><button class="btn btn-outline" onclick="closeUmModal()">关闭</button></div></div>';
+  document.body.appendChild(modal);
+  modal.addEventListener("click",e=>{if(e.target===modal)closeUmModal()});
+}
+function closeUmModal(){const m=document.getElementById("umModal");if(m)m.remove()}
+async function deleteUserAccount(username){
+  if(!confirm("确定删除用户 \\""+username+"\\" 吗？"))return;
+  const r=await apiCall("deleteUser",{username});
+  if(r){state=r.state;closeUmModal();renderApp();showToast("用户 "+username+" 已删除")}
+}
+
+async function showLogsModal(){
+  const result=await apiCall("getLogs");
+  if(!result)return;
+  const logs=result.logs||[];
+  let table='<table class="log-table"><thead><tr><th>时间</th><th>操作</th><th>用户</th><th>详情</th></tr></thead><tbody>';
+  logs.forEach(l=>{
+    let badgeClass="badge-info";
+    if(l.action.includes("删除")||l.action.includes("撤销")||l.action.includes("清空"))badgeClass="badge-danger";
+    else if(l.action.includes("登录")||l.action.includes("添加")||l.action.includes("授予"))badgeClass="badge-success";
+    table+='<tr><td>'+escapeHtml(l.time)+'</td><td><span class="badge '+badgeClass+'">'+escapeHtml(l.action)+'</span></td><td>'+escapeHtml(l.username)+'</td><td style="font-size:0.8rem">'+escapeHtml(l.detail||"-")+'</td></tr>';
+  });
+  table+='</tbody></table>';
+  const modal=document.createElement("div");modal.className="modal-overlay";modal.id="logModal";
+  modal.innerHTML='<div class="modal" style="max-width:750px"><h3><i class="fas fa-history"></i> 操作日志</h3><div style="max-height:450px;overflow-y:auto">'+(logs.length?table:'<div class="empty-state"><i class="fas fa-inbox"></i><p>暂无日志</p></div>')+'</div><div class="modal-actions"><button class="btn btn-danger btn-sm" onclick="clearLogs()"><i class="fas fa-trash"></i> 清空日志</button><button class="btn btn-outline" onclick="closeLogModal()">关闭</button></div></div>';
+  document.body.appendChild(modal);
+  modal.addEventListener("click",e=>{if(e.target===modal)closeLogModal()});
+}
+function closeLogModal(){const m=document.getElementById("logModal");if(m)m.remove()}
+async function clearLogs(){if(!confirm("确定清空所有操作日志？"))return;const r=await apiCall("clearLogs");if(r){closeLogModal();showToast("日志已清空")}}
+
+function setupNav(){
+  document.getElementById("navLinks").addEventListener("click",e=>{
+    const btn=e.target.closest(".nav-item");
+    if(!btn)return;
+    document.querySelectorAll(".nav-item").forEach(b=>b.classList.remove("active"));
+    btn.classList.add("active");
+    renderView();
+  });
+}
+
+function renderApp(){renderUserSection();renderView()}
+
+function renderUserSection(){
+  const sec=document.getElementById("userSection");
+  if(currentUser){
+    let html='<div class="user-badge" onclick="showProfileModal()"><i class="fas fa-user-circle"></i>'+escapeHtml(currentUser.nickname);
+    if(currentUser.role==="admin"){
+      html+='<span class="admin-badge">管理员</span>';
+      html+='<button class="btn btn-sm" onclick="event.stopPropagation();showUserManagementModal()" title="用户管理"><i class="fas fa-users-cog"></i></button>';
+      html+='<button class="btn btn-sm" onclick="event.stopPropagation();showLogsModal()" title="操作日志"><i class="fas fa-history"></i></button>';
+    }
+    html+='<button class="btn btn-sm" onclick="event.stopPropagation();logout()"><i class="fas fa-sign-out-alt"></i></button></div>';
+    sec.innerHTML=html;
+  }else{sec.innerHTML='<button class="btn btn-primary" onclick="showLogin()"><i class="fas fa-key"></i> 登录</button>'}
+}
+
+function showLogin(){
+  const username=prompt("请输入账号:");
+  if(!username)return;
+  const password=prompt("请输入密码:");
+  if(!password)return;
+  login(username,password);
+}
+
+function renderView(){
+  const view=document.querySelector(".nav-item.active")?.dataset.view||"intro";
+  const main=document.getElementById("mainContent");
+  if(!state){main.innerHTML='<div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>加载中...</p></div>';return}
+  switch(view){case"intro":renderIntro(main);break;case"posts":renderPosts(main);break;case"market":renderMarket(main);break;case"discuss":renderDiscuss(main);break}
+}
+
+function renderIntro(main){
+  let html='<div class="card"><div class="section-title"><i class="fas fa-info-circle"></i>社区介绍</div><div id="introContent" style="font-size:1rem">'+state.introContent+"</div>";
+  if(currentUser?.role==="admin"){
+    html+='<div class="admin-panel"><h4><i class="fas fa-edit"></i> 编辑介绍 (支持HTML)</h4><textarea class="textarea" id="editIntro" style="color:var(--text-primary);min-height:120px">'+state.introContent.replace(/</g,"&lt;").replace(/>/g,"&gt;")+'</textarea><button class="btn btn-primary" style="margin-top:10px" onclick="updateIntro()"><i class="fas fa-save"></i> 保存介绍</button></div><div class="admin-panel"><h4><i class="fas fa-user-plus"></i> 添加用户账号</h4><div class="flex-row"><input class="input" id="newUsername" placeholder="用户名"><input class="input" id="newPassword" type="password" placeholder="密码"><input class="input" id="newNickname" placeholder="昵称"><button class="btn btn-primary" onclick="addUser()"><i class="fas fa-plus"></i> 添加</button></div></div>';
+  }
+  html+="</div>";main.innerHTML=html;
+}
+async function updateIntro(){const c=document.getElementById("editIntro").value;const r=await apiCall("updateIntro",{content:c});if(r){state=r.state;renderApp();showToast("介绍已更新")}}
+async function addUser(){const u=document.getElementById("newUsername").value.trim();const p=document.getElementById("newPassword").value.trim();const n=document.getElementById("newNickname").value.trim();if(!u||!p)return showToast("用户名和密码必填","error");const r=await apiCall("addUser",{username:u,password:p,nickname:n});if(r){state=r.state;renderApp();showToast("用户 "+u+" 已添加")}}
+
+function renderPosts(main){
+  let html='<div class="card"><div class="section-title"><i class="fas fa-clipboard-list"></i>技术讨论帖 <span style="font-size:0.8rem;color:var(--text-muted)">'+state.posts.length+' 篇</span></div>';
+  if(currentUser){html+='<div class="flex-row"><input class="input" id="postTitle" placeholder="帖子标题" style="flex:2"><input class="input" id="postContent" placeholder="内容" style="flex:3"><button class="btn btn-primary" onclick="addPost()"><i class="fas fa-plus"></i>发布</button></div>'}
+  else{html+='<p style="margin-bottom:16px;color:var(--text-muted)"><i class="fas fa-lock"></i> 请登录后发布帖子</p>'}
+  if(state.posts.length===0){html+='<div class="empty-state"><i class="fas fa-inbox"></i><p>暂无帖子，来发第一篇吧</p></div>'}
+  else{state.posts.forEach(p=>{html+='<div class="list-item"><div class="list-item-content"><div class="list-item-title">'+escapeHtml(p.title)+'</div><div style="color:var(--text-secondary)">'+escapeHtml(p.content)+'</div><div class="list-item-meta"><span class="list-item-author"><i class="fas fa-user"></i> '+escapeHtml(p.authorNickname||p.author)+'</span> · <i class="far fa-calendar"></i> '+escapeHtml(p.date)+'</div></div>'+(currentUser?.role==="admin"||currentUser?.username===p.author?'<button class="btn btn-danger btn-sm" onclick="deletePost('+p.id+')"><i class="fas fa-trash"></i></button>':"")+"</div>"})}
+  html+="</div>";main.innerHTML=html;
+}
+async function addPost(){const t=document.getElementById("postTitle").value.trim();const c=document.getElementById("postContent").value.trim();if(!t||!c)return showToast("请填写标题和内容","error");const r=await apiCall("addPost",{title:t,content:c});if(r){state=r.state;renderApp();showToast("帖子发布成功")}}
+async function deletePost(id){if(!confirm("确定删除此帖子？"))return;const r=await apiCall("deletePost",{id});if(r){state=r.state;renderApp();showToast("帖子已删除")}}
+
+function renderMarket(main){
+  let html='<div class="card"><div class="section-title"><i class="fas fa-store"></i>元件市集 <span style="font-size:0.8rem;color:var(--text-muted)">'+state.marketItems.length+' 件</span></div>';
+  if(currentUser){html+='<div class="flex-row"><input class="input" id="itemName" placeholder="物品名称" style="flex:2"><input class="input" id="itemPrice" placeholder="价格" style="flex:1"><input class="input" id="itemDesc" placeholder="描述" style="flex:2"><button class="btn btn-primary" onclick="addMarketItem()"><i class="fas fa-tag"></i>发布</button></div>'}
+  else{html+='<p style="margin-bottom:16px;color:var(--text-muted)"><i class="fas fa-lock"></i> 请登录后发布交易信息</p>'}
+  if(state.marketItems.length===0){html+='<div class="empty-state"><i class="fas fa-box-open"></i><p>市集空空，来发布第一个物品吧</p></div>'}
+  else{state.marketItems.forEach(m=>{html+='<div class="list-item"><div class="list-item-content"><div class="list-item-title">'+escapeHtml(m.name)+' <span style="color:#f472b6;font-weight:700">'+escapeHtml(m.price)+'</span></div><div style="color:var(--text-secondary)">'+escapeHtml(m.desc||"暂无描述")+'</div><div class="list-item-meta">卖家: <span class="list-item-author">'+escapeHtml(m.sellerNickname||m.seller)+'</span></div></div>'+(currentUser?.role==="admin"||currentUser?.username===m.seller?'<button class="btn btn-danger btn-sm" onclick="deleteMarketItem('+m.id+')"><i class="fas fa-trash"></i></button>':"")+"</div>"})}
+  html+="</div>";main.innerHTML=html;
+}
+async function addMarketItem(){const n=document.getElementById("itemName").value.trim();const p=document.getElementById("itemPrice").value.trim();const d=document.getElementById("itemDesc").value.trim();if(!n||!p)return showToast("名称和价格必填","error");const r=await apiCall("addMarketItem",{name:n,price:p,desc:d});if(r){state=r.state;renderApp();showToast("物品发布成功")}}
+async function deleteMarketItem(id){if(!confirm("确定下架此物品？"))return;const r=await apiCall("deleteMarketItem",{id});if(r){state=r.state;renderApp();showToast("物品已下架")}}
+
+function renderDiscuss(main){
+  const hasAccess=currentUser&&(state.discussAccessUsers.includes(currentUser.username)||currentUser.role==="admin");
+  let html='<div class="card"><div class="section-title"><i class="fas fa-comment-dots"></i>设计讨论室 <span style="font-size:0.7rem;color:var(--text-muted);background:rgba(96,165,250,0.1);padding:3px 10px;border-radius:20px"><i class="fas fa-lock"></i> 受限</span></div>';
+  if(!hasAccess){html+='<div class="empty-state"><i class="fas fa-lock"></i><p>此板块需要管理员授予访问权限</p><p style="font-size:0.9rem">请联系管理员添加权限</p></div>'}
+  else{
+    html+='<div class="chat-box" id="chatBox">';
+    state.discussMessages.forEach(m=>{html+='<div class="msg-bubble"><span class="msg-user">'+escapeHtml(m.user)+'</span><span class="msg-time">'+escapeHtml(m.time)+'</span><div class="msg-text">'+escapeHtml(m.text)+'</div></div>'});
+    html+='</div><div class="flex-row"><input class="input" id="msgInput" placeholder="输入消息..." onkeypress="if(event.key===\'Enter\')sendMessage()"><button class="btn btn-primary" onclick="sendMessage()"><i class="fas fa-paper-plane"></i> 发送</button></div>';
+  }
+  if(currentUser?.role==="admin"){
+    html+='<div class="admin-panel"><h4><i class="fas fa-cog"></i> 管理设置</h4><div class="flex-row"><input class="input" id="grantUser" placeholder="授权用户名"><button class="btn btn-primary btn-sm" onclick="grantAccess()"><i class="fas fa-check"></i> 授予权限</button><button class="btn btn-danger btn-sm" onclick="revokeAccess()"><i class="fas fa-times"></i> 撤销权限</button></div><div class="flex-row" style="margin-top:8px"><label style="color:var(--text-secondary);font-size:0.9rem">消息保留(小时):</label><input class="input" id="retentionHours" type="number" value="'+state.messageRetentionHours+'" style="width:80px"><button class="btn btn-primary btn-sm" onclick="updateRetention()"><i class="fas fa-sync"></i> 更新</button><button class="btn btn-danger btn-sm" onclick="clearMessages()"><i class="fas fa-trash"></i> 清空聊天</button></div></div>';
+  }
+  html+="</div>";main.innerHTML=html;
+  if(hasAccess){setTimeout(()=>{const box=document.getElementById("chatBox");if(box)box.scrollTop=box.scrollHeight},100)}
+}
+async function sendMessage(){const input=document.getElementById("msgInput");const text=input.value.trim();if(!text)return;const r=await apiCall("sendMessage",{text});if(r){state=r.state;renderApp();setTimeout(()=>{const box=document.getElementById("chatBox");if(box)box.scrollTop=box.scrollHeight},100)}}
+async function grantAccess(){const u=document.getElementById("grantUser").value.trim();if(!u)return showToast("请输入用户名","error");const r=await apiCall("grantAccess",{username:u});if(r){state=r.state;renderApp();showToast(u+" 已获得讨论权限")}}
+async function revokeAccess(){const u=document.getElementById("grantUser").value.trim();if(!u)return showToast("请输入用户名","error");const r=await apiCall("revokeAccess",{username:u});if(r){state=r.state;renderApp();showToast("已撤销 "+u+" 的权限")}}
+async function updateRetention(){const h=document.getElementById("retentionHours").value;const r=await apiCall("updateRetention",{hours:parseInt(h)});if(r){state=r.state;renderApp();showToast("消息保留时间已更新")}}
+async function clearMessages(){if(!confirm("确定清空所有讨论消息？"))return;const r=await apiCall("clearMessages");if(r){state=r.state;renderApp();showToast("聊天记录已清空")}}
+
+setupNav();
+loadState();
+setInterval(async()=>{
+  if(isRefreshing)return;
+  if(document.querySelector(".nav-item.active")?.dataset.view==="discuss"){
+    isRefreshing=true;
+    try{const res=await fetch(API);const ns=await res.json();if(ns&&JSON.stringify(ns.discussMessages)!==JSON.stringify(state.discussMessages)){state=ns;renderView()}}catch(e){}finally{isRefreshing=false}
+  }
+},10000);
+</script>
+</body>
+</html>`;
+}
